@@ -54,7 +54,7 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_references_reach_ai_and_report_without_network(self):
         with patch('scripts.smart_reviewer.get_ai_client') as client:
-            client.return_value.chat.return_value = '{"issues": [], "recommendation": "comment"}'
+            client.return_value.chat.return_value = '{"issues": [], "overall_assessment": "No issues found", "recommendation": "comment"}'
             reviewer = SmartReviewer(verbose=False, knowledge_search=KnowledgeSearch(self.root))
             report = reviewer.review('507049', verbose=False)
             self.assertEqual(report['knowledge_retrieval']['references'][0]['url'], self.issue['html_url'])

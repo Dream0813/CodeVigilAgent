@@ -80,13 +80,13 @@ def validate_ai_result(result) -> Dict:
             raise ValueError(f'issues[{index}] 缺少 title 或 description')
     if 'positive_points' in result and not isinstance(result['positive_points'], list):
         raise ValueError('positive_points 必须是数组')
-    if 'overall_assessment' in result and not isinstance(result['overall_assessment'], str):
-        raise ValueError('overall_assessment 必须是字符串')
-    if 'recommendation' in result:
-        recommendation = result['recommendation']
-        if not isinstance(recommendation, str) or recommendation.strip().lower() not in RECOMMENDATIONS:
-            raise ValueError(f'recommendation 必须是 {"/".join(RECOMMENDATIONS)} 之一，实际是 {recommendation!r}')
-        result['recommendation'] = recommendation.strip().lower()
+    assessment = result.get('overall_assessment')
+    if not isinstance(assessment, str) or not assessment.strip():
+        raise ValueError('AI 返回缺少有效的 overall_assessment 字段')
+    recommendation = result.get('recommendation')
+    if not isinstance(recommendation, str) or recommendation.strip().lower() not in RECOMMENDATIONS:
+        raise ValueError(f'recommendation 必须是 {"/".join(RECOMMENDATIONS)} 之一，实际是 {recommendation!r}')
+    result['recommendation'] = recommendation.strip().lower()
     return result
 
 
@@ -470,7 +470,12 @@ class SmartReviewer:
         return {
             'issues': issues,
             'method': 'rule_based',
-            'note': '使用规则引擎审查（配置 AI 可获得更智能的审查）'
+            'note': '使用规则引擎审查（配置 AI 可获得更智能的审查）',
+            'overall_assessment': (
+                f'规则引擎发现 {len(issues)} 个问题；建议逐项核实。' if issues else
+                '规则引擎未命中已知问题规则；该结果不等同于完整语义审查。'
+            ),
+            'recommendation': 'comment',
         }
 
     def review(self, content: str, metadata: Dict = None, verbose: bool = True,

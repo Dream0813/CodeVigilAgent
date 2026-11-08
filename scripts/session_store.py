@@ -92,7 +92,7 @@ def _session_filename(name: str) -> str:
     return f'{safe or "session"}.json'
 
 
-def save_session(agent, name: Optional[str] = None) -> Path:
+def save_session(agent, name: Optional[str] = None, *, update_latest: bool = True) -> Path:
     payload = serialize_agent(agent)
     if name:
         if name.strip().isdigit() or name.strip().lower() in (
@@ -108,7 +108,8 @@ def save_session(agent, name: Optional[str] = None) -> Path:
         target = root / f'session-{_stamp()}.json'
     text = json.dumps(payload, ensure_ascii=False, indent=2) + '\n'
     target.write_text(text, encoding='utf-8')
-    (root / LATEST_NAME).write_text(text, encoding='utf-8')
+    if update_latest:
+        (root / LATEST_NAME).write_text(text, encoding='utf-8')
     return target
 
 

@@ -112,6 +112,8 @@ class ModelJsonValidationTests(unittest.TestCase):
                '{"issues": [{"severity": "urgent", "title": "t"}]}',
                '{"issues": [{"severity": "high"}]}',
                '{"issues": [], "recommendation": "ship-it"}',
+               '{"issues": [], "recommendation": "comment"}',
+               '{"issues": [], "overall_assessment": "ok"}',
                '{"issues": [], "positive_points": "good"}', 'not json']
         for response in bad:
             with self.subTest(response=response):
@@ -120,11 +122,12 @@ class ModelJsonValidationTests(unittest.TestCase):
                 self.assertNotIn('issues', result)
 
     def test_valid_results_pass_and_are_normalized(self):
-        result = self.review('{"issues": [], "recommendation": "Comment"}')
+        result = self.review('{"issues": [], "overall_assessment": "No issues found", "recommendation": "Comment"}')
         self.assertEqual((result['issues'], result['recommendation']), ([], 'comment'))
-        result = self.review('```json\n{"issues": [{"severity": "HIGH", "title": "t"}]}\n```')
+        result = self.review('```json\n{"issues": [{"severity": "HIGH", "title": "t"}], "overall_assessment": "Found an issue", "recommendation": "comment"}\n```')
         self.assertEqual(result['issues'][0]['severity'], 'high')
-        validate_ai_result({'issues': [{'severity': 'low', 'description': 'd'}]})
+        validate_ai_result({'issues': [{'severity': 'low', 'description': 'd'}],
+                            'overall_assessment': 'Review complete', 'recommendation': 'comment'})
 
     def test_error_report_prints_without_crashing_and_cli_exits_nonzero(self):
         reviewer = ai_reviewer('{"issues": "invalid-type"}')
@@ -184,7 +187,7 @@ def run_cli_review(root, **overrides):
 class TruncationTests(unittest.TestCase):
     def test_prompt_and_report_state_truncation(self):
         with temp_repo(extra_lines=80) as root, patch('scripts.smart_reviewer.get_ai_client') as factory:
-            factory.return_value.chat.return_value = '{"issues": [], "recommendation": "approve"}'
+            factory.return_value.chat.return_value = '{"issues": [], "overall_assessment": "No issues found", "recommendation": "approve"}'
             code, out, err = run_cli_review(root, max_diff=600)
             prompt = factory.return_value.chat.call_args.kwargs['prompt']
         self.assertEqual(code, 0)
@@ -198,7 +201,7 @@ class TruncationTests(unittest.TestCase):
 
     def test_full_diff_has_no_warning_and_full_coverage(self):
         with temp_repo(DELETED_CUDA) as root, patch('scripts.smart_reviewer.get_ai_client') as factory:
-            factory.return_value.chat.return_value = '{"issues": []}'
+            factory.return_value.chat.return_value = '{"issues": [], "overall_assessment": "No issues found", "recommendation": "approve"}'
             code, out, _ = run_cli_review(root)
             prompt = factory.return_value.chat.call_args.kwargs['prompt']
         self.assertEqual(code, 0)

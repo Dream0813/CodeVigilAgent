@@ -62,11 +62,31 @@ def review(args: argparse.Namespace) -> int:
     try:
         context = collect_repo_context(staged=args.staged, max_diff_chars=args.max_diff)
     except RepoContextError as exc:
-        print(f"[ERROR] {exc}")
+        if args.json:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        else:
+            print(f"[ERROR] {exc}")
         return 1
 
     if not context["diff"].strip():
-        print("[INFO] 暂存区没有可审查的 diff。" if args.staged else "[INFO] 没有可审查的已跟踪文件 diff；未跟踪文件尚未纳入审查。")
+        message = ("暂存区没有可审查的 diff。" if args.staged else
+                   "没有可审查的已跟踪文件 diff；未跟踪文件尚未纳入审查。")
+        if args.json:
+            print(json.dumps({
+                "status": "no_changes",
+                "message": message,
+                "review_result": {
+                    "issues": [],
+                    "overall_assessment": "没有可审查的改动。",
+                    "coverage": "full",
+                    "coverage_note": message,
+                },
+                "knowledge_retrieval": {"references": [], "warnings": []},
+                "specialist_context": {"status": "not_run"},
+                "metadata": {"changed_files": []},
+            }, ensure_ascii=False))
+        else:
+            print(f"[INFO] {message}")
         return 0
     if context["diff_truncated"]:
         if args.require_full:
@@ -82,6 +102,7 @@ def review(args: argparse.Namespace) -> int:
     # 显式 --scenario 或 --require-scenario：含糊/缺失则停；默认自动判定失败时退回通用审查
     if specialist.status in ("missing_agent", "incomplete") or (require_scenario and specialist.status == "needs_context"):
         payload = {
+            "status": "needs_context",
             "needs_context": specialist.status == "needs_context",
             "specialist_context": specialist.as_dict(),
             "question": specialist.question or specialist.reason,
@@ -122,15 +143,48 @@ def review(args: argparse.Namespace) -> int:
         specialist_text=specialist_text,
         specialist_meta=meta,
     )
-    result = report.get("review_result", {})
+    result = report.get("review_result") if isinstance(report, dict) else None
+    report_error = not isinstance(report, dict)
+    if report_error:
+        report = {"status": "error", "error": "审查器返回的报告不是 JSON 对象。"}
+    elif isinstance(result, dict) and result.get("error"):
+        report["status"] = "error"
+    else:
+        knowledge = report.get("knowledge_retrieval")
+        metadata = report.get("metadata")
+        repository = metadata.get("repository") if isinstance(metadata, dict) else None
+        missing = []
+        if not isinstance(result, dict) or not isinstance(result.get("issues"), list):
+            missing.append("review_result.issues")
+        if not isinstance(result, dict) or not isinstance(result.get("overall_assessment"), str) or not result["overall_assessment"].strip():
+            missing.append("review_result.overall_assessment")
+        if not isinstance(result, dict) or result.get("recommendation") not in ("approve", "request_changes", "comment"):
+            missing.append("review_result.recommendation")
+        if not isinstance(result, dict) or result.get("coverage") not in ("full", "partial"):
+            missing.append("review_result.coverage")
+        if not isinstance(knowledge, dict) or not isinstance(knowledge.get("references"), list) or not isinstance(knowledge.get("warnings"), list):
+            missing.append("knowledge_retrieval")
+        if not isinstance(repository, dict) or not isinstance(repository.get("changed_files"), list):
+            missing.append("metadata.repository.changed_files")
+        if missing:
+            report = {
+                "status": "error",
+                "error": "审查报告缺少有效字段：" + ", ".join(missing),
+            }
+            report_error = True
+        else:
+            report["status"] = "complete"
     if args.output:
         Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[OUTPUT] 报告已保存: {args.output}", file=sys.stderr)
     if not args.json:
-        reviewer.print_report(report)
+        if report_error:
+            print(f"[ERROR] {report['error']}")
+        else:
+            reviewer.print_report(report)
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 1 if result.get("error") else 0
+    return 1 if report_error or (isinstance(result, dict) and result.get("error")) else 0
 
 
 def test(args: argparse.Namespace) -> int:
@@ -951,6 +1005,12 @@ def chat(args: argparse.Namespace) -> int:
     try:
         client = get_ai_client(_default_config(args.config))
     except Exception as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "ok": False,
+                "error": "AI 配置不可用，请在模型设置中检查服务商、模型和 API Key。",
+            }, ensure_ascii=False))
+            return 1
         print(f"[ERROR] AI 未配置: {exc}")
         if args.message:
             print("[INFO] 非交互模式：请先 `reviewagent config --wizard` 或设置 OPENAI_API_KEY。")
@@ -967,13 +1027,37 @@ def chat(args: argparse.Namespace) -> int:
     quiet = os.environ.get('REVIEWAGENT_NODE_UI') == '1'
 
     def _on_progress(message: str) -> None:
-        think_progress(message)
+        if not getattr(args, "json", False):
+            think_progress(message)
 
     agent = ConversationAgent(
         client,
         network=args.network,
         progress=_on_progress,
     )
+
+    session_name = getattr(args, "session", None)
+    if session_name:
+        if (len(session_name) > 64 or not all(
+                ch.isascii() and (ch.isalnum() or ch in "-_") for ch in session_name)):
+            agent.close()
+            error = "会话名仅允许 1-64 个 ASCII 字母、数字、下划线或连字符。"
+            if getattr(args, "json", False):
+                print(json.dumps({"ok": False, "error": error}, ensure_ascii=False))
+            else:
+                print(f"[ERROR] {error}")
+            return 1
+        try:
+            apply_to_agent(agent, load_session(session_name))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            agent.close()
+            if getattr(args, "json", False):
+                print(json.dumps({"ok": False, "error": f"无法恢复会话：{exc}"}, ensure_ascii=False))
+            else:
+                print(f"[ERROR] 无法恢复会话：{exc}")
+            return 1
 
     def _reload_client(overrides=None):
         nonlocal client, agent
@@ -994,12 +1078,30 @@ def chat(args: argparse.Namespace) -> int:
     if args.multiline:
         print(warn('已开启多行模式：回车换行，/send 发送，/cancel 取消。'))
     if args.message:
-        begin_think('思考中')
+        if not getattr(args, "json", False):
+            begin_think('思考中')
         try:
             reply = agent.answer(args.message)
         finally:
             agent.close()
-            end_think('回答就绪')
+            if not getattr(args, "json", False):
+                end_think('回答就绪')
+        if session_name and agent.last_ok:
+            try:
+                save_session(agent, session_name, update_latest=False)
+            except (OSError, ValueError) as exc:
+                if getattr(args, "json", False):
+                    print(json.dumps({"ok": False, "error": f"回答未能保存到会话：{exc}"}, ensure_ascii=False))
+                else:
+                    print(f"[ERROR] 回答未能保存到会话：{exc}")
+                return 1
+        if getattr(args, "json", False):
+            provider = getattr(client, "provider", client)
+            api_key = getattr(provider, "api_key", "")
+            if api_key:
+                reply = reply.replace(api_key, "[API Key 已隐藏]")
+            print(json.dumps({"ok": bool(agent.last_ok), "reply": reply}, ensure_ascii=False))
+            return 0 if agent.last_ok else 1
         _print_agent_reply(reply)
         return 0 if agent.last_ok else 1
     while True:
@@ -1235,6 +1337,8 @@ def main() -> int:
     chat_parser = subparsers.add_parser('chat', help='唤醒对话 Agent（默认命令）')
     chat_parser.add_argument('--config', default=None)
     chat_parser.add_argument('--message', '-m', help='一次性自然语言请求')
+    chat_parser.add_argument('--session', help='在多次 CLI 调用间继续命名会话')
+    chat_parser.add_argument('--json', action='store_true', help='以 JSON 输出一次性请求结果')
     chat_parser.add_argument('--multiline', action='store_true', help='每条消息都使用多行输入，/send 发送')
     chat_parser.add_argument('--network', choices=['auto', 'on', 'off'], default='auto',
                              help='auto 按需联网；on 每轮搜索；off 禁用外部资料获取（AI 调用仍联网）')

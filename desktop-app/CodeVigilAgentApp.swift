@@ -1,8 +1,78 @@
 import Cocoa
+import Darwin
+import UniformTypeIdentifiers
 
 private enum AgentTask {
-    case chat(String)
+    case chat(String, String)
     case review
+    case sessionsList(String)
+    case sessionShow(String)
+    case sessionRename(String, String)
+    case sessionDelete(String)
+    case sessionExport(String, String)
+}
+
+private struct HistoryRow {
+    let name: String
+    let title: String
+    let summary: String
+    let updatedAt: String
+    let repository: String
+    let status: String
+
+    init(_ data: [String: Any]) {
+        name = data["name"] as? String ?? ""
+        title = data["title"] as? String ?? name
+        summary = data["summary"] as? String ?? ""
+        updatedAt = data["saved_at"] as? String ?? ""
+        repository = data["repository"] as? String ?? ""
+        status = data["status"] as? String ?? "completed"
+    }
+}
+
+private final class HistoryCell: NSTableCellView {
+    private let title = NSTextField(labelWithString: "")
+    private let updatedAt = NSTextField(labelWithString: "")
+    private let summary = NSTextField(wrappingLabelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let header = NSStackView(views: [title, updatedAt])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 6
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        updatedAt.font = .systemFont(ofSize: 10)
+        updatedAt.textColor = .secondaryLabelColor
+        updatedAt.alignment = .right
+        summary.font = .systemFont(ofSize: 11)
+        summary.textColor = .secondaryLabelColor
+        summary.lineBreakMode = .byTruncatingTail
+        summary.maximumNumberOfLines = 2
+        [header, summary].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            addSubview($0)
+        }
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            summary.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            summary.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            summary.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
+            summary.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -5),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(_ row: HistoryRow) {
+        title.stringValue = row.title
+        summary.stringValue = row.summary.isEmpty ? "（空对话）" : row.summary
+        updatedAt.stringValue = String(row.updatedAt.replacingOccurrences(of: "T", with: " ").prefix(16))
+        toolTip = "\(row.repository)\n\(row.status)"
+    }
 }
 
 private final class ProcessOutput {
@@ -23,22 +93,53 @@ private final class ProcessOutput {
     }
 }
 
-final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+private final class ReaderCompletion {
+    private let lock = NSLock()
+    private let group: DispatchGroup
+    private var finished = false
+
+    init(_ group: DispatchGroup) { self.group = group }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        finished = true
+        group.leave()
+    }
+}
+
+final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+                                    NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
     private let repositoryField = NSTextField()
     private let promptField = NSTextField()
     private let outputView = NSTextView()
     private let statusLabel = NSTextField(labelWithString: "就绪")
+    private let historySearchField = NSSearchField()
+    private let historyTableView = NSTableView()
     private var sendButton: NSButton!
     private var cancelButton: NSButton!
     private var newConversationButton: NSButton!
     private var clearDisplayButton: NSButton!
+    private var renameSessionButton: NSButton!
+    private var deleteSessionButton: NSButton!
+    private var exportSessionButton: NSButton!
     private var actionButtons: [NSButton] = []
+    private var historyRows: [HistoryRow] = []
+    private var currentSessionName: String?
+    private var currentTitle = "新对话"
+    private var currentMessages: [[String: Any]] = []
+    private var openSessionAfterRefresh: String?
+    private var suppressHistorySelection = false
+    private var searchWorkItem: DispatchWorkItem?
     private var runningProcess: Process?
     private var runningPipes: [Pipe] = []
     private var runningReaders: DispatchGroup?
+    private var runningReaderCompletions: [ReaderCompletion] = []
     private var activeTaskID: UUID?
     private var cancelRequested = false
+    private var statusAfterHistoryRefresh: String?
     private var sessionID = UUID().uuidString
     private var sessionRepository = ""
 
@@ -46,6 +147,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         buildWindow()
         repositoryField.stringValue = UserDefaults.standard.string(forKey: "lastRepositoryPath") ?? ""
         sessionRepository = repositoryField.stringValue
+        refreshSessions()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -147,30 +249,90 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         cancelButton.isHidden = true
         newConversationButton = makeButton("新对话", action: #selector(newConversation))
         clearDisplayButton = makeButton("清空显示", action: #selector(clearDisplay))
+        renameSessionButton = makeButton("重命名", action: #selector(renameConversation))
+        deleteSessionButton = makeButton("删除", action: #selector(deleteConversation))
+        exportSessionButton = makeButton("导出", action: #selector(exportConversation))
         newConversationButton.toolTip = "开始新的会话并清空当前显示；旧会话文件会保留"
         clearDisplayButton.toolTip = "只清空屏幕上的消息，不会清除当前会话上下文"
-        let chatRow = NSStackView(views: [promptField, sendButton, cancelButton,
-                                          newConversationButton, clearDisplayButton])
+        let chatRow = NSStackView(views: [promptField, sendButton, cancelButton, clearDisplayButton])
         chatRow.orientation = .horizontal
         chatRow.alignment = .centerY
         chatRow.spacing = 10
         promptField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let stack = NSStackView(views: [header, repoRow, actionRow, scrollView, chatRow])
-        stack.orientation = .vertical
-        stack.alignment = .width
-        stack.spacing = 14
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        content.addSubview(stack)
+        historySearchField.placeholderString = "搜索标题和消息"
+        historySearchField.target = self
+        historySearchField.action = #selector(searchSessions)
+        historySearchField.sendsSearchStringImmediately = true
+        historyTableView.headerView = nil
+        historyTableView.rowHeight = 70
+        historyTableView.usesAlternatingRowBackgroundColors = true
+        historyTableView.delegate = self
+        historyTableView.dataSource = self
+        let historyColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("history"))
+        historyTableView.addTableColumn(historyColumn)
+        let historyScroll = NSScrollView()
+        historyScroll.documentView = historyTableView
+        historyScroll.hasVerticalScroller = true
+        historyScroll.borderType = .bezelBorder
+        historyScroll.translatesAutoresizingMaskIntoConstraints = false
+        let historyActions = NSStackView(views: [newConversationButton, renameSessionButton,
+                                                 deleteSessionButton, exportSessionButton])
+        historyActions.orientation = .horizontal
+        historyActions.alignment = .centerY
+        historyActions.spacing = 4
+        [newConversationButton, renameSessionButton, deleteSessionButton, exportSessionButton].forEach {
+            $0.font = .systemFont(ofSize: 11, weight: .medium)
+        }
+        let sidebarStack = NSStackView(views: [historySearchField, historyScroll, historyActions])
+        sidebarStack.orientation = .vertical
+        sidebarStack.alignment = .width
+        sidebarStack.spacing = 9
+        sidebarStack.translatesAutoresizingMaskIntoConstraints = false
+        let sidebar = NSView()
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(sidebarStack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+            sidebarStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            sidebarStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
+            sidebarStack.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
+            sidebarStack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
+            historySearchField.heightAnchor.constraint(equalToConstant: 30),
+        ])
+
+        let mainStack = NSStackView(views: [header, repoRow, actionRow, scrollView, chatRow])
+        mainStack.orientation = .vertical
+        mainStack.alignment = .width
+        mainStack.spacing = 14
+        mainStack.translatesAutoresizingMaskIntoConstraints = false
+        let mainPanel = NSView()
+        mainPanel.translatesAutoresizingMaskIntoConstraints = false
+        mainPanel.addSubview(mainStack)
+        NSLayoutConstraint.activate([
+            mainStack.leadingAnchor.constraint(equalTo: mainPanel.leadingAnchor, constant: 16),
+            mainStack.trailingAnchor.constraint(equalTo: mainPanel.trailingAnchor, constant: -18),
+            mainStack.topAnchor.constraint(equalTo: mainPanel.topAnchor, constant: 16),
+            mainStack.bottomAnchor.constraint(equalTo: mainPanel.bottomAnchor, constant: -16),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 320),
             repositoryField.heightAnchor.constraint(equalToConstant: 30),
             promptField.heightAnchor.constraint(equalToConstant: 30),
+        ])
+
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addSubview(sidebar)
+        splitView.addSubview(mainPanel)
+        NSLayoutConstraint.activate([
+            sidebar.widthAnchor.constraint(equalToConstant: 255),
+        ])
+        content.addSubview(splitView)
+        NSLayoutConstraint.activate([
+            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            splitView.topAnchor.constraint(equalTo: content.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
 
         window = NSWindow(
@@ -219,15 +381,15 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     @objc private func configureModel() {
-        let configRoot = ProcessInfo.processInfo.environment["REVIEWAGENT_HOME"] ??
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
-        let configURL = URL(fileURLWithPath: configRoot).appendingPathComponent("ai_config.json")
+        let configURL = modelConfigURL()
         let existing = (try? Data(contentsOf: configURL)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
         let provider = NSPopUpButton()
         provider.addItems(withTitles: ["deepseek", "openai", "claude", "glm"])
-        provider.selectItem(withTitle: existing["provider"] as? String ?? "deepseek")
+        let existingProvider = existing["provider"] as? String ?? "deepseek"
+        if provider.item(withTitle: existingProvider) == nil { provider.addItem(withTitle: existingProvider) }
+        provider.selectItem(withTitle: existingProvider)
         let model = NSTextField(string: existing["model"] as? String ?? "deepseek-chat")
         let baseURL = NSTextField(string: existing["base_url"] as? String ?? "")
         baseURL.placeholderString = "默认地址（可留空）"
@@ -261,15 +423,17 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         config["base_url"] = baseURL.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if !key.stringValue.isEmpty {
             config["api_key"] = key.stringValue
-        } else if selectedProvider != (existing["provider"] as? String ?? "deepseek") {
-            config["api_key"] = ""
         }
         do {
             try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: configURL, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
-            setStatus("设置已保存")
+            if let model = validateModelConfiguration() {
+                setStatus("配置已保存并可加载：\(model)")
+            } else {
+                setStatus("设置已保存；Python CLI 未能加载，请检查配置")
+            }
         } catch {
             appendOutput("\n保存模型设置失败：\(error.localizedDescription)\n")
             setStatus("设置失败")
@@ -278,26 +442,192 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
     @objc private func sendPrompt() {
         let prompt = promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+        guard !prompt.isEmpty, runningProcess == nil else { return }
         promptField.stringValue = ""
         let repository = repositoryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if repository != sessionRepository {
             sessionID = UUID().uuidString
+            currentSessionName = nil
+            currentTitle = "新对话"
+            currentMessages = []
             sessionRepository = repository
-            outputView.string = ""
-            appendOutput("已切换仓库，开始新的对话会话。\n\n", color: .secondaryLabelColor)
         }
-        runAgent(arguments: ["chat", "--message", prompt, "--network", "auto",
-                             "--session", "desktop-\(sessionID)", "--json"],
-                 task: .chat(prompt))
+        let sessionName = currentSessionName ?? "desktop-\(sessionID)"
+        currentSessionName = sessionName
+        let repositoryPath = repository.isEmpty ? "" : URL(fileURLWithPath: repository).standardizedFileURL.path
+        currentMessages.append(["role": "user", "content": prompt, "status": "running"])
+        renderConversation()
+        let arguments = ["chat", "--message", prompt, "--network", "auto",
+                         "--session", sessionName, "--repository", repositoryPath, "--json"]
+        runAgent(arguments: arguments, task: .chat(prompt, sessionName))
     }
 
     @objc private func newConversation() {
         guard runningProcess == nil else { return }
         sessionID = UUID().uuidString
-        outputView.string = ""
-        appendOutput("已开始新对话。旧会话仍保留在本机。\n\n", color: .secondaryLabelColor)
+        currentSessionName = nil
+        currentTitle = "新对话"
+        currentMessages = []
+        sessionRepository = repositoryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        suppressHistorySelection = true
+        historyTableView.deselectAll(nil)
+        suppressHistorySelection = false
+        renderConversation()
         setStatus("新对话")
+    }
+
+    @objc private func searchSessions() {
+        searchWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refreshSessions() }
+        searchWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    @objc private func renameConversation() {
+        guard let name = currentSessionName, runningProcess == nil else { return }
+        let field = NSTextField(string: currentTitle)
+        field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        let alert = NSAlert()
+        alert.messageText = "重命名对话"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let title = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { setStatus("标题不能为空"); return }
+        runAgent(arguments: ["sessions", "rename", name, title], task: .sessionRename(name, title))
+    }
+
+    @objc private func deleteConversation() {
+        guard let name = currentSessionName, runningProcess == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "删除这条历史对话？"
+        alert.informativeText = "对话记录会从本机移除，无法撤销。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        runAgent(arguments: ["sessions", "delete", name], task: .sessionDelete(name))
+    }
+
+    @objc private func exportConversation() {
+        guard let name = currentSessionName, runningProcess == nil else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(safeFilename(currentTitle)).md"
+        panel.allowedContentTypes = [.plainText]
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.runAgent(arguments: ["sessions", "export", name, "--output", url.path],
+                           task: .sessionExport(name, url.path))
+        }
+    }
+
+    private func safeFilename(_ text: String) -> String {
+        let safe = text.replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "-", options: .regularExpression)
+        return String((safe.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64)))
+    }
+
+    private func modelConfigURL() -> URL {
+        let environment = ProcessInfo.processInfo.environment
+        if let configured = environment["REVIEWAGENT_CONFIG"], !configured.isEmpty {
+            return URL(fileURLWithPath: (configured as NSString).expandingTildeInPath)
+        }
+        let root = environment["REVIEWAGENT_HOME"] ??
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
+        return URL(fileURLWithPath: (root as NSString).expandingTildeInPath)
+            .appendingPathComponent("ai_config.json")
+    }
+
+    private func validateModelConfiguration() -> String? {
+        let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                               "\(NSHomeDirectory())/.local/bin/python3", "/usr/bin/python3"]
+        guard let path = pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            return nil
+        }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.currentDirectoryURL = backendRoot()
+        process.arguments = ["-c", "from scripts.ai_adapter import get_ai_client; c=get_ai_client(); import json; print(json.dumps({'model': c.provider_name + '/' + c.model_name}))"]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONPATH"] = backendRoot().path + ":" + (environment["PYTHONPATH"] ?? "")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["REVIEWAGENT_HOME"] = environment["REVIEWAGENT_HOME"] ??
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
+        environment["REVIEWAGENT_CONFIG"] = modelConfigURL().standardizedFileURL.path
+        process.environment = environment
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            guard process.terminationStatus == 0,
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+                return nil
+            }
+            return payload["model"]
+        } catch {
+            return nil
+        }
+    }
+
+    private func refreshSessions(openCurrent: Bool = false) {
+        if openCurrent { openSessionAfterRefresh = currentSessionName }
+        var arguments = ["sessions", "list"]
+        let query = historySearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty { arguments += ["--query", query] }
+        runAgent(arguments: arguments, task: .sessionsList(query))
+    }
+
+    private func openSession(_ name: String) {
+        guard runningProcess == nil else { return }
+        runAgent(arguments: ["sessions", "show", name], task: .sessionShow(name))
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { historyRows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard historyRows.indices.contains(row) else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("HistoryCell")
+        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? HistoryCell) ??
+            HistoryCell(frame: .zero)
+        cell.identifier = identifier
+        cell.configure(historyRows[row])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !suppressHistorySelection,
+              let table = notification.object as? NSTableView,
+              historyRows.indices.contains(table.selectedRow) else { return }
+        openSession(historyRows[table.selectedRow].name)
+    }
+
+    private func renderConversation() {
+        outputView.string = ""
+        appendOutput("\(currentTitle)\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
+        let repository = repositoryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        appendOutput("仓库：\(repository.isEmpty ? "未关联" : repository)\n\n", color: .secondaryLabelColor)
+        for message in currentMessages {
+            let role = message["role"] as? String ?? ""
+            let content = message["content"] as? String ?? ""
+            let state = message["status"] as? String ?? "completed"
+            if role == "user" {
+                appendOutput("你\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
+                appendOutput(content + "\n")
+                switch state {
+                case "running": appendOutput("Agent 正在生成…\n\n", color: .secondaryLabelColor)
+                case "failed":
+                    appendOutput("请求失败；未生成成功回复。\n", color: .systemRed, bold: true)
+                    if let error = message["error"] as? String { appendOutput(error + "\n\n", color: .systemRed) }
+                case "interrupted": appendOutput("请求中断；没有成功回复。\n\n", color: .systemOrange)
+                default: appendOutput("\n")
+                }
+            } else if role == "assistant", state == "completed" {
+                appendOutput("Agent\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
+                appendOutput(content + "\n\n")
+            }
+        }
     }
 
     @objc private func clearDisplay() {
@@ -366,7 +696,14 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         }
 
         let repo = repositoryField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let workingDirectory = repo.isEmpty ? backendRoot() : URL(fileURLWithPath: repo)
+        let sessionOperation: Bool
+        switch task {
+        case .sessionsList(_), .sessionShow(_), .sessionRename(_, _), .sessionDelete(_), .sessionExport(_, _):
+            sessionOperation = true
+        default:
+            sessionOperation = false
+        }
+        let workingDirectory = sessionOperation || repo.isEmpty ? backendRoot() : URL(fileURLWithPath: repo)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: workingDirectory.path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
@@ -396,42 +733,58 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         process.executableURL = URL(fileURLWithPath: pythonPath)
         let cliPath = backendRoot().appendingPathComponent("ascend_cli.py").path
         process.arguments = ["-c", """
-            import os, signal, subprocess, sys
-            child = subprocess.Popen([sys.executable] + sys.argv[1:], start_new_session=True)
+            import os, signal, subprocess, sys, time
+            child = None
+            stop_signal = 0
             def stop(signum, _frame):
-                if child.poll() is None:
+                global stop_signal
+                stop_signal = signum
+                if child is not None:
                     try:
                         os.killpg(child.pid, signal.SIGTERM)
-                        child.wait(timeout=1)
+                        time.sleep(0.1)
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                     except (ProcessLookupError, ChildProcessError):
                         pass
-                    except subprocess.TimeoutExpired:
-                        os.killpg(child.pid, signal.SIGKILL)
-                        child.wait()
-                raise SystemExit(128 + signum)
             signal.signal(signal.SIGTERM, stop)
-            sys.exit(child.wait())
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            try:
+                child = subprocess.Popen([sys.executable] + sys.argv[1:], start_new_session=True)
+            finally:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+            status = child.wait()
+            sys.exit(128 + stop_signal if stop_signal else status)
             """, cliPath] + arguments
         process.currentDirectoryURL = workingDirectory
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONPATH"] = backendRoot().path + ":" + (environment["PYTHONPATH"] ?? "")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["REVIEWAGENT_HOME"] = environment["REVIEWAGENT_HOME"] ??
             URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
+        environment["REVIEWAGENT_CONFIG"] = modelConfigURL().standardizedFileURL.path
         process.environment = environment
 
         switch task {
-        case .chat(let prompt):
+        case .chat(let prompt, _):
             appendOutput("你\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
             appendOutput(prompt + "\n\n")
-        case .review:
-            appendOutput(offlineReviewHeading(arguments) + "\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
+        case .review, .sessionsList(_), .sessionShow(_), .sessionRename(_, _), .sessionDelete(_), .sessionExport(_, _):
+            if case .review = task {
+                appendOutput(offlineReviewHeading(arguments) + "\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
+            }
         }
         setStatus("运行中…")
         runningProcess = process
         runningPipes = [stdoutPipe, stderrPipe]
         runningReaders = readers
+        let stdoutCompletion = ReaderCompletion(readers)
+        let stderrCompletion = ReaderCompletion(readers)
+        runningReaderCompletions = [stdoutCompletion, stderrCompletion]
         activeTaskID = taskID
         cancelRequested = false
         setControlsRunning(true)
@@ -440,7 +793,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                readers.leave()
+                stdoutCompletion.finish()
             }
             else { output.append(data, isError: false) }
         }
@@ -449,14 +802,22 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                readers.leave()
+                stderrCompletion.finish()
             }
             else { output.append(data, isError: true) }
         }
         process.terminationHandler = { [weak self] terminatedProcess in
             guard let self else { return }
             DispatchQueue.global().async {
-                readers.wait()
+                let readersFinished = readers.wait(timeout: .now() + 5) == .success
+                if !readersFinished {
+                    [stdoutPipe, stderrPipe].forEach { pipe in
+                        pipe.fileHandleForReading.readabilityHandler = nil
+                        try? pipe.fileHandleForReading.close()
+                    }
+                    stdoutCompletion.finish()
+                    stderrCompletion.finish()
+                }
                 DispatchQueue.main.async {
                     guard self.activeTaskID == taskID else { return }
                     let (stdout, stderr) = output.values()
@@ -465,13 +826,25 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
                     self.runningProcess = nil
                     self.runningPipes = []
                     self.runningReaders = nil
+                    self.runningReaderCompletions = []
                     self.activeTaskID = nil
                     self.setControlsRunning(false)
                     if self.cancelRequested {
-                        self.appendOutput("\n任务已取消。\n", color: .systemOrange)
-                        self.setStatus("已取消")
+                        if case .chat = task {
+                            if let index = self.currentMessages.lastIndex(where: {
+                                $0["role"] as? String == "user" && $0["status"] as? String == "running"
+                            }) {
+                                self.currentMessages[index]["status"] = "interrupted"
+                            }
+                            self.renderConversation()
+                            self.statusAfterHistoryRefresh = "已取消"
+                            self.refreshSessions()
+                        } else {
+                            self.appendOutput("\n任务已取消。\n", color: .systemOrange)
+                            self.setStatus("已取消")
+                        }
                     } else {
-                        self.finishTask(task, status: terminatedProcess.terminationStatus,
+                        self.finishTask(task, status: readersFinished ? terminatedProcess.terminationStatus : -1,
                                         stdout: stdout, stderr: stderr)
                     }
                 }
@@ -482,6 +855,8 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             try process.run()
         } catch {
             runningProcess = nil
+            runningReaderCompletions.forEach { $0.finish() }
+            runningReaderCompletions = []
             [stdoutPipe, stderrPipe].forEach { pipe in
                 pipe.fileHandleForReading.readabilityHandler = nil
                 try? pipe.fileHandleForReading.close()
@@ -502,28 +877,111 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
     private func finishTask(_ task: AgentTask, status: Int32, stdout: Data, stderr: Data) {
         switch task {
-        case .chat:
+        case .chat(_, let name):
             guard let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any] else {
                 appendOutput("请求失败：CLI 返回无效 JSON。\n\(safeDiagnostic(stderr))\n", color: .systemRed)
                 setStatus("请求失败")
+                openSessionAfterRefresh = name
+                refreshSessions()
                 return
             }
             guard status == 0, payload["ok"] as? Bool == true else {
                 appendOutput("Agent 请求失败：\(payload["error"] as? String ?? "CLI 以退出码 \(status) 结束。")\n",
                              color: .systemRed)
                 setStatus("请求失败")
+                openSessionAfterRefresh = name
+                refreshSessions()
                 return
             }
-            guard let reply = payload["reply"] as? String else {
+            guard payload["reply"] as? String != nil else {
                 appendOutput("请求失败：JSON 响应缺少 Agent 回复。\n", color: .systemRed)
                 setStatus("请求失败")
+                openSessionAfterRefresh = name
+                refreshSessions()
                 return
             }
-            appendOutput("Agent\n", color: NSColor(calibratedRed: 0.48, green: 0.92, blue: 0.78, alpha: 1), bold: true)
-            appendOutput(reply + "\n\n")
-            setStatus("完成")
+            openSessionAfterRefresh = name
+            refreshSessions()
         case .review:
             renderReview(status: status, stdout: stdout, stderr: stderr)
+        case .sessionsList:
+            guard status == 0,
+                  let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any],
+                  payload["ok"] as? Bool == true,
+                  let sessions = payload["sessions"] as? [[String: Any]] else {
+                setStatus("历史读取失败")
+                return
+            }
+            historyRows = sessions.map(HistoryRow.init)
+            historyTableView.reloadData()
+            if let name = openSessionAfterRefresh {
+                openSessionAfterRefresh = nil
+                openSession(name)
+            } else {
+                setStatus(statusAfterHistoryRefresh ?? "历史已更新")
+                statusAfterHistoryRefresh = nil
+            }
+        case .sessionShow:
+            guard status == 0,
+                  let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any],
+                  payload["ok"] as? Bool == true,
+                  let session = payload["session"] as? [String: Any],
+                  let name = session["name"] as? String,
+                  let messages = session["messages"] as? [[String: Any]] else {
+                appendOutput("\n无法恢复这条本地对话。\n", color: .systemRed)
+                setStatus("历史恢复失败")
+                return
+            }
+            currentSessionName = name
+            currentTitle = session["title"] as? String ?? name
+            currentMessages = messages
+            let repository = session["repository"] as? String ?? ""
+            repositoryField.stringValue = repository
+            sessionRepository = repository
+            if !repository.isEmpty { UserDefaults.standard.set(repository, forKey: "lastRepositoryPath") }
+            if name.hasPrefix("desktop-") { sessionID = String(name.dropFirst("desktop-".count)) }
+            renderConversation()
+            suppressHistorySelection = true
+            if let row = historyRows.firstIndex(where: { $0.name == name }) {
+                historyTableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            } else {
+                historyTableView.deselectAll(nil)
+            }
+            suppressHistorySelection = false
+            setStatus("已恢复对话")
+            setControlsRunning(false)
+        case .sessionRename(_, let title):
+            guard let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any],
+                  payload["ok"] as? Bool == true else {
+                setStatus("重命名失败")
+                return
+            }
+            currentTitle = title
+            openSessionAfterRefresh = currentSessionName
+            refreshSessions()
+        case .sessionDelete(let name):
+            guard let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any],
+                  payload["ok"] as? Bool == true else {
+                setStatus("删除失败")
+                return
+            }
+            if currentSessionName == name {
+                currentSessionName = nil
+                currentTitle = "新对话"
+                currentMessages = []
+                sessionID = UUID().uuidString
+                sessionRepository = repositoryField.stringValue
+                renderConversation()
+            }
+            refreshSessions()
+            setStatus("历史已删除")
+        case .sessionExport(_, let path):
+            guard let payload = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any],
+                  payload["ok"] as? Bool == true else {
+                setStatus("导出失败")
+                return
+            }
+            setStatus("已导出：\(path)")
         }
     }
 
@@ -644,11 +1102,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         var detail = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         let environment = ProcessInfo.processInfo.environment
         var secrets = ["AI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"].compactMap { environment[$0] }
-        let configPath = environment["REVIEWAGENT_CONFIG"] ??
-            URL(fileURLWithPath: environment["REVIEWAGENT_HOME"] ??
-                URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path)
-                .appendingPathComponent("ai_config.json").path
-        if let config = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+        if let config = try? Data(contentsOf: modelConfigURL()),
            let object = try? JSONSerialization.jsonObject(with: config) as? [String: Any],
            let key = object["api_key"] as? String {
             secrets.append(key)
@@ -666,6 +1120,11 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         actionButtons.forEach { $0.isEnabled = !running }
         newConversationButton.isEnabled = !running
         clearDisplayButton.isEnabled = !running
+        historySearchField.isEnabled = !running
+        historyTableView.isEnabled = !running
+        renameSessionButton.isEnabled = !running && currentSessionName != nil
+        deleteSessionButton.isEnabled = !running && currentSessionName != nil
+        exportSessionButton.isEnabled = !running && currentSessionName != nil
         cancelButton.isHidden = !running
         cancelButton.isEnabled = running
     }
@@ -673,20 +1132,29 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     private func terminate(_ process: Process) {
         process.terminate()
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-            if process.isRunning { process.terminate() }
+            if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
         }
     }
 
     private func stopProcessForTermination() {
         guard let process = runningProcess else { return }
-        process.terminate()
-        process.waitUntilExit()
-        runningReaders?.wait()
         activeTaskID = nil
+        process.terminate()
+        let deadline = Date().addingTimeInterval(3)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
+        process.terminationHandler = nil
         runningPipes.forEach { pipe in
             pipe.fileHandleForReading.readabilityHandler = nil
             try? pipe.fileHandleForReading.close()
         }
+        runningReaderCompletions.forEach { $0.finish() }
+        runningReaderCompletions = []
+        runningReaders?.wait()
+        runningReaders = nil
         runningPipes = []
         runningProcess = nil
     }

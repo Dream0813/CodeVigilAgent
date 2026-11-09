@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt
@@ -41,9 +42,13 @@ from scripts.model_catalog import (
 from scripts.session_store import (
     apply_to_agent,
     clean_sessions,
+    delete_session,
     list_sessions,
     load_session,
+    redact_secrets,
+    rename_session,
     save_session,
+    session_markdown,
     start_new_conversation,
 )
 from scripts.ci_log_analyzer import analyze_ci_log, format_ci_report
@@ -56,6 +61,49 @@ def _default_config(cli_value: str = None) -> str:
     if cli_value and cli_value not in ('unused.json',):
         return cli_value
     return resolve_config_file(None)
+
+
+def sessions_cmd(args: argparse.Namespace) -> int:
+    try:
+        if args.action == 'list':
+            result = {'ok': True, 'sessions': list_sessions(limit=None, query=args.query or '')}
+        elif args.action == 'show':
+            data = load_session(args.name)
+            session_title = next((row['title'] for row in list_sessions(limit=None)
+                                  if row['name'] == Path(data.get('_path', args.name)).stem),
+                                 Path(args.name).stem)
+            repository = data.get('desktop_repository')
+            if not isinstance(repository, str):
+                repository = data.get('work_root') or ''
+            result = {
+                'ok': True,
+                'session': {
+                    'name': Path(data.get('_path', args.name)).stem,
+                    'title': session_title,
+                    'repository': repository,
+                    'saved_at': data.get('saved_at', ''),
+                    'messages': data.get('desktop_messages') or [
+                        {**row, 'status': 'completed'} for row in data.get('history', [])
+                        if isinstance(row, dict) and row.get('role') in ('user', 'assistant')
+                    ],
+                },
+            }
+        elif args.action == 'rename':
+            result = {'ok': True, 'session': rename_session(args.name, args.title)}
+        elif args.action == 'delete':
+            delete_session(args.name)
+            result = {'ok': True, 'deleted': args.name}
+        elif args.action == 'export':
+            destination = Path(args.output).expanduser()
+            destination.write_text(session_markdown(args.name), encoding='utf-8')
+            result = {'ok': True, 'path': str(destination)}
+        else:
+            result = {'ok': False, 'error': '未知的会话操作'}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+        return 1
 
 
 def review(args: argparse.Namespace) -> int:
@@ -156,6 +204,19 @@ def review(args: argparse.Namespace) -> int:
         missing = []
         if not isinstance(result, dict) or not isinstance(result.get("issues"), list):
             missing.append("review_result.issues")
+        elif isinstance(result.get("issues"), list):
+            for index, issue in enumerate(result["issues"], 1):
+                if not isinstance(issue, dict):
+                    missing.append(f"review_result.issues[{index}]")
+                    continue
+                if issue.get("severity") not in ("critical", "high", "medium", "low"):
+                    missing.append(f"review_result.issues[{index}].severity")
+                if not any(isinstance(issue.get(key), str) and issue[key].strip()
+                           for key in ("title", "type")):
+                    missing.append(f"review_result.issues[{index}].title/type")
+                for field in ("location", "description", "suggestion"):
+                    if not isinstance(issue.get(field), str) or not issue[field].strip():
+                        missing.append(f"review_result.issues[{index}].{field}")
         if not isinstance(result, dict) or not isinstance(result.get("overall_assessment"), str) or not result["overall_assessment"].strip():
             missing.append("review_result.overall_assessment")
         if not isinstance(result, dict) or result.get("recommendation") not in ("approve", "request_changes", "comment"):
@@ -174,6 +235,7 @@ def review(args: argparse.Namespace) -> int:
             report_error = True
         else:
             report["status"] = "complete"
+    report = redact_secrets(report)
     if args.output:
         Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[OUTPUT] 报告已保存: {args.output}", file=sys.stderr)
@@ -1058,6 +1120,11 @@ def chat(args: argparse.Namespace) -> int:
             else:
                 print(f"[ERROR] 无法恢复会话：{exc}")
             return 1
+        repository = getattr(args, 'repository', None)
+        if repository is not None:
+            agent.desktop_repository = str(Path(repository).expanduser().resolve()) if repository else ''
+        elif not hasattr(agent, 'desktop_repository'):
+            agent.desktop_repository = str(agent.work_root)
 
     def _reload_client(overrides=None):
         nonlocal client, agent
@@ -1080,18 +1147,53 @@ def chat(args: argparse.Namespace) -> int:
     if args.message:
         if not getattr(args, "json", False):
             begin_think('思考中')
+        turn = None
+        if session_name:
+            now = datetime.now().astimezone().isoformat(timespec='seconds')
+            if not getattr(agent, 'desktop_title', None):
+                agent.desktop_title = ' '.join(args.message.split())[:64] or '新对话'
+            turn = {
+                'role': 'user', 'content': args.message, 'status': 'running',
+                'started_at': now, 'updated_at': now,
+            }
+            agent.desktop_messages = list(getattr(agent, 'desktop_messages', []) or [])
+            agent.desktop_messages.append(turn)
+            try:
+                save_session(agent, session_name, update_latest=False, include_all_history=True)
+            except (OSError, ValueError) as exc:
+                agent.close()
+                if not getattr(args, "json", False):
+                    print(f"[ERROR] 无法保存会话：{exc}")
+                else:
+                    print(json.dumps({'ok': False, 'error': '无法在本机保存会话。'}, ensure_ascii=False))
+                return 1
         try:
             reply = agent.answer(args.message)
+        except Exception:
+            reply = 'Agent 请求失败；请检查服务配置或网络后重试。'
+            agent.last_ok = False
         finally:
             agent.close()
             if not getattr(args, "json", False):
                 end_think('回答就绪')
-        if session_name and agent.last_ok:
+        reply = redact_secrets(reply, agent)
+        if turn is not None:
+            turn['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            if agent.last_ok:
+                turn['status'] = 'completed'
+                agent.desktop_messages.append({
+                    'role': 'assistant', 'content': reply, 'status': 'completed',
+                    'updated_at': turn['updated_at'],
+                })
+            else:
+                turn['status'] = 'failed'
+                turn['error'] = reply
+        if session_name:
             try:
-                save_session(agent, session_name, update_latest=False)
+                save_session(agent, session_name, update_latest=False, include_all_history=True)
             except (OSError, ValueError) as exc:
                 if getattr(args, "json", False):
-                    print(json.dumps({"ok": False, "error": f"回答未能保存到会话：{exc}"}, ensure_ascii=False))
+                    print(json.dumps({"ok": False, "error": "回答未能保存到本机会话。"}, ensure_ascii=False))
                 else:
                     print(f"[ERROR] 回答未能保存到会话：{exc}")
                 return 1
@@ -1100,7 +1202,9 @@ def chat(args: argparse.Namespace) -> int:
             api_key = getattr(provider, "api_key", "")
             if api_key:
                 reply = reply.replace(api_key, "[API Key 已隐藏]")
-            print(json.dumps({"ok": bool(agent.last_ok), "reply": reply}, ensure_ascii=False))
+            print(json.dumps({"ok": bool(agent.last_ok),
+                              "reply": reply if agent.last_ok else None,
+                              "error": None if agent.last_ok else reply}, ensure_ascii=False))
             return 0 if agent.last_ok else 1
         _print_agent_reply(reply)
         return 0 if agent.last_ok else 1
@@ -1338,11 +1442,32 @@ def main() -> int:
     chat_parser.add_argument('--config', default=None)
     chat_parser.add_argument('--message', '-m', help='一次性自然语言请求')
     chat_parser.add_argument('--session', help='在多次 CLI 调用间继续命名会话')
+    chat_parser.add_argument('--repository', help='桌面对话关联的本地仓库路径')
     chat_parser.add_argument('--json', action='store_true', help='以 JSON 输出一次性请求结果')
     chat_parser.add_argument('--multiline', action='store_true', help='每条消息都使用多行输入，/send 发送')
     chat_parser.add_argument('--network', choices=['auto', 'on', 'off'], default='auto',
                              help='auto 按需联网；on 每轮搜索；off 禁用外部资料获取（AI 调用仍联网）')
     chat_parser.set_defaults(func=chat)
+
+    sessions_parser = subparsers.add_parser('sessions', help='管理本地桌面对话历史')
+    sessions_actions = sessions_parser.add_subparsers(dest='action', required=True)
+    sessions_list = sessions_actions.add_parser('list')
+    sessions_list.add_argument('--query', default='')
+    sessions_list.set_defaults(func=sessions_cmd)
+    sessions_show = sessions_actions.add_parser('show')
+    sessions_show.add_argument('name')
+    sessions_show.set_defaults(func=sessions_cmd)
+    sessions_rename = sessions_actions.add_parser('rename')
+    sessions_rename.add_argument('name')
+    sessions_rename.add_argument('title')
+    sessions_rename.set_defaults(func=sessions_cmd)
+    sessions_delete = sessions_actions.add_parser('delete')
+    sessions_delete.add_argument('name')
+    sessions_delete.set_defaults(func=sessions_cmd)
+    sessions_export = sessions_actions.add_parser('export')
+    sessions_export.add_argument('name')
+    sessions_export.add_argument('--output', required=True)
+    sessions_export.set_defaults(func=sessions_cmd)
 
     config_parser = subparsers.add_parser('config', help='初始化/查看/设置 ~/.reviewagent 配置')
     config_parser.add_argument('--config', default=None)

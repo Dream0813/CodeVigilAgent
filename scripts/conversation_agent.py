@@ -502,7 +502,8 @@ class ConversationAgent:
             lines.append('')
             lines.append(msg.get('content') or '')
             lines.append('')
-        out.write_text('\n'.join(lines), encoding='utf-8')
+        from scripts.session_store import redact_secrets
+        out.write_text(redact_secrets('\n'.join(lines), self), encoding='utf-8')
         return str(out.resolve())
 
     def set_chat_mode(self, mode: str) -> str:

@@ -461,6 +461,11 @@ async function runOnboarding() {
       if (pick === EXIT) return quit();
       provider = pick;
       meta = PROVIDERS.find((p) => p.value === provider);
+      // 从确认页退回重选时，上一轮的填写结果必须清空 ——
+      // 新服务商若不需要 base_url，旧值会被一起写进配置。
+      model = null;
+      base_url = '';
+      api_key = '';
       stage = 'model';
       continue;
     }
@@ -601,7 +606,45 @@ async function runOnboarding() {
         continue;
       }
       api_key = v;
-      break;
+      stage = 'confirm';
+      continue;
+    }
+
+    // ---- 保存前确认：填完了还能反悔 ----------------------------------------
+    // 之前填完 Key 就直接写盘，发现选错了只能整体重跑（reviewagent config -w）。
+    // 这里补一个摘要 + 退回入口。
+    if (stage === 'confirm') {
+      clearScreen();
+      const summary = [
+        ['服务商', `${meta.name} → ${provider}`],
+        ['模型', model],
+      ];
+      if (base_url) summary.push(['base_url', base_url]);
+      summary.push(['密钥', '已填写（不显示）']);
+      process.stdout.write(wizardBanner(summary, '确认'));
+
+      const { action } = await inquirer.prompt([
+        {
+          ...base,
+          type: 'list',
+          name: 'action',
+          message: c.brand('配置是否正确？') + c.mute('（↑↓ 选择，回车确认）'),
+          choices: [
+            { name: c.ok('✓  保存并启动'), value: 'save' },
+            new inquirer.Separator(),
+            { name: `${c.accent('←')}  改 API Key`, value: 'key' },
+            { name: `${c.accent('←')}  改模型`, value: 'model' },
+            { name: `${c.accent('←')}  改服务商`, value: 'provider' },
+            new inquirer.Separator(),
+            { name: c.mute(G.close + '  退出配置（不写入）'), value: EXIT },
+          ],
+        },
+      ]);
+
+      if (action === EXIT) return quit();
+      if (action === 'save') break;
+      stage = action;
+      continue;
     }
   }
 

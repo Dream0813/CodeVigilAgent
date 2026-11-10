@@ -11,14 +11,28 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 import textwrap
+import unicodedata
 from datetime import datetime
 
-# Windows 编码设置
-if sys.platform == 'win32':
-    import io
-    if not isinstance(sys.stdout, io.TextIOWrapper) or sys.stdout.encoding.lower() != 'utf-8':
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+# Windows 编码设置放在函数里执行（见 _configure_console）。
+# 原来写在模块级：任何 import chat_v2 的代码都会在导入瞬间被换掉 sys.stdout，
+# 调用方此前尚未 flush 的输出会整段丢失 —— frame_doctor 因此只显示得到 1 个盒子。
+def _configure_console() -> None:
+    """Windows 控制台编码：尽量切 UTF-8，切不动就退回「编码不了就替换」。"""
+    if sys.platform == 'win32':
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, 'reconfigure', None)
+            if reconfigure is None:
+                continue
+            try:
+                reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+            except Exception:
+                pass
+    try:
+        from scripts.console_safe import harden_console
+        harden_console()
+    except Exception:
+        pass
 
 # 项目路径
 project_root = Path(__file__).parent
@@ -28,6 +42,7 @@ try:
     from scripts.smart_reviewer import SmartReviewer
     from scripts.ai_adapter import get_ai_client
     from scripts.github_fetcher import UniversalFetcher, WebSearcher
+    from scripts import term_frame as tf
 except ImportError as e:
     print(f"[ERROR] 导入失败: {e}")
     sys.exit(1)
@@ -54,6 +69,13 @@ class Style:
     MAGENTA = '\033[35m'
     CYAN = '\033[36m'
     WHITE = '\033[37m'
+
+    # 品牌色（与启动画面的青 #00C2A8 / 粉 #FF8FAB 对齐）
+    # 用 256 色而不是 24-bit，兼容旧版 Windows conhost
+    BRAND = '\033[38;5;37m'    # 主色 青绿
+    ACCENT = '\033[38;5;212m'  # 强调 粉
+    GLOW = '\033[38;5;80m'     # 高亮 浅青
+    FAINT = '\033[38;5;240m'   # 极弱 灰
 
     # 亮色版本
     BRIGHT_BLACK = '\033[90m'
@@ -89,6 +111,50 @@ class Style:
 USE_COLORS = Style.enabled()
 
 
+# ---------------------------------------------------------------------------
+# 字形表：Windows 传统控制台（conhost）用的是宋体，不含 ❯ ✓ ✕ ✎ ✦ › 这些符号，
+# 直接输出会显示成方块 □。这里按终端能力自动降级到 GBK 里一定有的字符，
+# 也可以用环境变量 REVIEWAGENT_GLYPHS=fancy|safe 强制指定。
+# ---------------------------------------------------------------------------
+def _unicode_glyphs() -> bool:
+    override = os.environ.get('REVIEWAGENT_GLYPHS', '').lower()
+    if override == 'fancy':
+        return True
+    if override == 'safe':
+        return False
+    if sys.platform != 'win32':
+        return True
+    # Windows 一律保守：终端类型（conhost / Windows Terminal）判断不可靠，
+    # 用户也可能给 WT 配了宋体。宁可朴素，也不要满屏方块。
+    # 想用花哨符号：set REVIEWAGENT_GLYPHS=fancy
+    return False
+
+
+class G:
+    """字形表。
+
+    下面这些在 GBK 里本来就有，宋体也能渲染，两种终端都能用，故不做降级：
+      圆角边框 ╭ ╮ ╰ ╯ 、竖色块 ▌ 、列表符号 ◆ 、箭头 ←
+    只有 GBK 真的没收、字体也画不出来的才降级：
+      ❯ ✕ ✎ ✦ › ✓ ✗ ⚠ ℹ ◐ • 盲文转轮
+    """
+
+    _f = _unicode_glyphs()
+
+    TL = '╭'
+    TR = '╮'
+    BL = '╰'
+    BR = '╯'
+    BAR = '▌'
+    BULLET = '◆'
+    PROMPT = '❯' if _f else '>'
+    OK = '✓' if _f else '√'
+    BAD = '✗' if _f else '×'
+    WARN = '⚠' if _f else '!'
+    INFO = 'ℹ' if _f else 'i'
+    WORKING = '◐' if _f else '●'
+
+
 def colored(text: str, color: str) -> str:
     """添加颜色"""
     if not USE_COLORS:
@@ -115,64 +181,113 @@ def dim(text: str) -> str:
 # ============================================================================
 
 class UI:
-    """UI 工具类"""
+    """UI 工具类
+
+    宽度只有一个出处：`scripts.term_frame`。以前这里自己实现了一套
+    _w/_tokens/_wrap/_pad，把 EAW=A 的字符（· ◆ →）算成 1 列，而
+    term_frame 算 2 列 —— 同一个程序两套算法，右边框必然对不上。
+    """
 
     @staticmethod
-    def box(title: str, content: str = "", width: int = 70):
-        """绘制边框盒子"""
+    def _w(text: str) -> int:
+        """按终端显示宽度计数：中文/全角算 2 列，ANSI 码不计"""
+        return tf.display_width(text)
+
+    @staticmethod
+    def _tokens(text: str):
+        return list(tf._tokens(text))
+
+    @staticmethod
+    def _wrap(text: str, width: int):
+        """按终端显示宽度折行（保留颜色码，中文不会被劈坏）"""
+        return tf.wrap_display(text, width)
+
+    @staticmethod
+    def _pad(text: str, target: int) -> str:
+        """按显示宽度右侧补空格"""
+        return tf.pad_display(text, target)
+
+    @staticmethod
+    def box(title: str = "", content: str = "", width: int = 0):
+        """绘制圆角边框盒子（品牌色边线）。
+
+        width=0 表示跟随 term_frame.total_width()，与输入框、思考面板
+        用同一个宽度 —— 这样同一屏里所有竖线才落在同一列。
+        """
+        total = width or tf.total_width()
+        inner = total - 2
         lines = []
+        border = lambda s: colored(s, Style.BRAND)
 
-        # 顶部
-        lines.append("┌" + "─" * (width - 2) + "┐")
+        # 顶部圆角
+        lines.append(border(tf.top_border('', total)))
 
-        # 标题
+        # 标题居中 + 细分隔线
         if title:
-            padding = (width - 2 - len(title)) // 2
-            title_line = "│" + " " * padding + title + " " * (width - 2 - padding - len(title)) + "│"
-            lines.append(title_line)
-            lines.append("├" + "─" * (width - 2) + "┤")
+            safe = tf.frame_safe(title)
+            # 调用方已上色就不再包一层，避免嵌套 RESET 把颜色吃掉
+            rendered = safe if '\033[' in safe else bold(colored(safe, Style.BRAND))
+            tw = tf.display_width(rendered)
+            left = max((inner - tw) // 2, 0)
+            right = max(inner - left - tw, 0)
+            lines.append(
+                border('│')
+                + ' ' * left + rendered + ' ' * right
+                + border('│')
+            )
+            lines.append(border('├' + '─' * inner + '┤'))
 
         # 内容
         if content:
             for line in content.split('\n'):
-                wrapped = textwrap.wrap(line, width - 4) if line else ['']
-                for wrapped_line in wrapped:
-                    content_line = "│ " + wrapped_line.ljust(width - 4) + " │"
-                    lines.append(content_line)
+                for w in tf.wrap_display(line, tf.content_width(total)):
+                    lines.append(
+                        border('│')
+                        + ' ' + tf.pad_display(tf.frame_safe(w), tf.content_width(total)) + ' '
+                        + border('│')
+                    )
 
-        # 底部
-        lines.append("└" + "─" * (width - 2) + "┘")
+        # 底部圆角
+        lines.append(border(tf.bottom_border('', total)))
 
         return '\n'.join(lines)
 
     @staticmethod
-    def section(title: str, width: int = 70):
-        """章节标题"""
-        return "\n" + colored("─" * width, Style.DIM) + "\n" + bold(title) + "\n" + colored("─" * width, Style.DIM)
+    def section(title: str, width: int = 0):
+        """章节标题：`▌ 标题 ──────`，横线补到与盒子同宽
+
+        这一行没有右边框，所以就算 `▌` 的宽度判断和终端差 1 列也看不出来，
+        保留 `▌` 的观感比换成 `|` 划算。
+        """
+        total = width or tf.total_width()
+        safe = tf.frame_safe(title)
+        bar = '─' * max(total - tf.display_width(safe) - 4, 3)
+        return f"\n{colored(G.BAR, Style.ACCENT)} {bold(safe)} {colored(bar, Style.FAINT)}\n"
 
     @staticmethod
-    def bullet(text: str, symbol: str = "•") -> str:
+    def bullet(text: str, symbol: str = G.BULLET) -> str:
         """带符号的列表项"""
-        return f"  {colored(symbol, Style.CYAN)} {text}"
+        return f"  {colored(symbol, Style.BRAND)} {text}"
 
     @staticmethod
     def status(text: str, status_type: str = "info") -> str:
-        """状态消息"""
+        """状态消息（无方括号，图标直接带色）"""
         icons = {
-            'success': ('✓', Style.GREEN),
-            'error': ('✗', Style.RED),
-            'warning': ('⚠', Style.YELLOW),
-            'info': ('ℹ', Style.BLUE),
-            'working': ('⋯', Style.CYAN)
+            'success': (G.OK, Style.GREEN),
+            'error': (G.BAD, Style.RED),
+            'warning': (G.WARN, Style.YELLOW),
+            'info': (G.INFO, Style.GLOW),
+            'working': (G.WORKING, Style.BRAND),
         }
 
-        icon, color = icons.get(status_type, ('•', Style.WHITE))
-        return colored(f"[{icon}]", color) + f" {text}"
+        icon, color = icons.get(status_type, ('·', Style.WHITE))
+        return f"{colored(icon, color)} {text}"
 
     @staticmethod
     def spinner(text: str) -> str:
-        """进度指示"""
-        return colored("⣾⣽⣻⢿⡿⣟⣯⣷", Style.CYAN) + f" {text}"
+        """进度指示（盲文字符宋体没有，降级成 ASCII 转轮）"""
+        frames = "⣾⣽⣻⢿⡿⣟⣯⣷" if G._f else "|/-\\"
+        return colored(frames, Style.BRAND) + f" {text}"
 
     @staticmethod
     def code_block(code: str, language: str = "") -> str:
@@ -215,7 +330,9 @@ class ReviewAgentChat:
             except:
                 pass
 
-        self.github_fetcher = GitHubFetcher(token=github_token)
+        # 原来写的是 GitHubFetcher，但 scripts/github_fetcher.py 里没有这个类，
+        # 真正能用的是 UniversalFetcher（GitHub / Gitee / GitCode 通用）。
+        self.github_fetcher = UniversalFetcher(github_token=github_token)
 
     def initialize(self):
         """初始化系统"""
@@ -257,7 +374,7 @@ class ReviewAgentChat:
             print(UI.bullet(f"{i}. {bold(name)} - {desc}{current}"))
 
         try:
-            choice = input(f"\n{colored('?', Style.CYAN)} 请选择 (1-{len(providers)}, 回车保持不变): ").strip()
+            choice = input(f"\n{colored(G.PROMPT, Style.ACCENT)} 请选择 (1-{len(providers)}, 回车保持不变): ").strip()
 
             if not choice:
                 print(UI.status("保持当前配置", "info"))
@@ -269,8 +386,8 @@ class ReviewAgentChat:
 
                 # 如果切换服务商，需要新的 API Key
                 if provider != current_provider:
-                    print(f"\n{colored('?', Style.CYAN)} 请输入你的 {name} API Key:")
-                    api_key = input(f"{colored('>', Style.DIM)} ").strip()
+                    print(f"\n{colored(G.PROMPT, Style.ACCENT)} 请输入你的 {name} API Key:")
+                    api_key = input(f"{colored(G.PROMPT, Style.ACCENT)} ").strip()
 
                     if not api_key:
                         print(UI.status("API Key 不能为空", "error"))
@@ -317,7 +434,7 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
 
         while True:
             try:
-                choice = input(f"\n{colored('?', Style.CYAN)} 请选择 (1-{len(providers)}): ").strip()
+                choice = input(f"\n{colored(G.PROMPT, Style.ACCENT)} 请选择 (1-{len(providers)}): ").strip()
                 idx = int(choice) - 1
                 if 0 <= idx < len(providers):
                     name, provider, model, _ = providers[idx]
@@ -329,9 +446,9 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
                 print(UI.status("无效输入", "error"))
 
         # 获取 API Key
-        print(f"\n{colored('?', Style.CYAN)} 请输入你的 {name} API Key:")
+        print(f"\n{colored(G.PROMPT, Style.ACCENT)} 请输入你的 {name} API Key:")
         print(dim("  (API Key 会保存在本地，不会上传)"))
-        api_key = input(f"{colored('>', Style.DIM)} ").strip()
+        api_key = input(f"{colored(G.PROMPT, Style.ACCENT)} ").strip()
 
         if not api_key:
             print(UI.status("API Key 不能为空", "error"))
@@ -357,7 +474,7 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
             print(UI.status("连接成功！", "success"))
         except Exception as e:
             print(UI.status(f"连接失败: {e}", "error"))
-            retry = input(f"\n{colored('?', Style.CYAN)} 重新配置? (y/n): ").strip().lower()
+            retry = input(f"\n{colored(G.PROMPT, Style.ACCENT)} 重新配置? (y/n): ").strip().lower()
             if retry == 'y':
                 return self.setup_wizard()
             else:
@@ -373,26 +490,34 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
 
     def show_welcome(self):
         """显示欢迎信息"""
-        welcome = f"""
-{bold('ReviewAgent')} - 智能代码审查助手 v1.0
-
-专为昇腾 NPU 生态打造，基于 {colored('733 issues', Style.GREEN)} + {colored('745 PRs', Style.GREEN)} 的实战经验
-
-{colored('快速开始:', Style.CYAN)}
-  • 直接粘贴代码进行审查
-  • 发送 GitHub/Gitee URL 分析 PR/Issue
-  • 提问昇腾 NPU 相关技术问题
-
-{colored('命令:', Style.CYAN)}
-  /help    - 显示帮助
-  /clear   - 清除对话历史
-  /config  - 重新配置 AI
-  /stats   - 显示统计信息
-  /exit    - 退出
-
-{dim('提示: 输入多行内容后按 Ctrl+D (Linux/Mac) 或 Ctrl+Z (Windows) 提交')}
-"""
-        print(welcome)
+        head = (
+            f"{bold(colored('ReviewAgent', Style.BRAND))}"
+            f" {colored('智能代码审查助手', Style.ACCENT)}"
+            f" {dim('v1.2')}"
+        )
+        body = '\n'.join([
+            '',
+            f"  {dim('昇腾 NPU 生态')} · 基于 {colored('733 issues', Style.BRAND)}"
+            f" + {colored('745 PRs', Style.BRAND)} 实战经验",
+            '',
+            f"  {colored(G.BAR, Style.ACCENT)} {bold('能做什么')}",
+            UI.bullet('粘贴代码 → 直接审查'),
+            UI.bullet('发送 GitHub / Gitee 链接 → 分析 PR / Issue'),
+            UI.bullet('提问昇腾 NPU 相关问题'),
+            '',
+            f"  {colored(G.BAR, Style.ACCENT)} {bold('命令')}",
+            f"  {colored('/help', Style.BRAND)}    帮助        "
+            f"{colored('/clear', Style.BRAND)}   清空对话",
+            f"  {colored('/config', Style.BRAND)}  重配 AI     "
+            f"{colored('/stats', Style.BRAND)}   统计信息",
+            f"  {colored('/exit', Style.BRAND)}    退出",
+            '',
+            f"  {dim('提示：多行内容按两次回车提交 · Ctrl+C 中断当前请求')}",
+            '',
+        ])
+        print()
+        print(UI.box(head, body))
+        print()
 
     def parse_command(self, user_input: str) -> Optional[str]:
         """解析命令"""
@@ -419,6 +544,52 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
             print(UI.status(f"未知命令: /{cmd}", "error"))
             print(dim("输入 /help 查看可用命令"))
             return 'unknown'
+
+    def handle_fetch_and_review(self, urls):
+        """抓取 GitHub / Gitee / GitCode 的 PR、Issue 或网页，然后出审查报告。
+
+        原来这个分支调用的是 self.handle_fetch_and_review(...)，但类里没有这个方法，
+        所以「发一个 GitHub 链接」必然报 AttributeError。这里补上。
+        """
+        if isinstance(urls, str):
+            urls = [urls]
+        urls = [u for u in (urls or []) if u]
+        if not urls:
+            print(UI.status("没识别到网址，请把链接一起发给我", "error"))
+            return
+
+        if not getattr(self, 'github_fetcher', None):
+            self._init_github_fetcher()
+
+        if not self.reviewer:
+            print(UI.status("审查器还没初始化完成，请稍后再试", "error"))
+            return
+
+        for url in urls:
+            print(UI.status(f"抓取 {url} ...", "working"), flush=True)
+            try:
+                data = self.github_fetcher.fetch_url(url)
+            except Exception as e:
+                print(UI.status(f"抓取失败: {e}", "error"))
+                continue
+
+            if not data:
+                print(UI.status("这个链接没抓到内容（可能是私有仓库，或链接格式不支持）", "error"))
+                continue
+
+            try:
+                text = self.github_fetcher.format_for_review(data)
+            except Exception as e:
+                print(UI.status(f"内容整理失败: {e}", "error"))
+                continue
+
+            print(UI.status("抓到了，开始审查...", "working"), flush=True)
+            try:
+                report = self.reviewer.review(text)
+                print()
+                self.reviewer.print_report(report)
+            except Exception as e:
+                print(UI.status(f"审查失败: {e}", "error"))
 
     def handle_help(self):
         """显示帮助"""
@@ -467,9 +638,9 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
   > /search 昇腾 NPU 性能优化
 
 【输入提示】
-  • 单行输入: 直接输入后回车
-  • 多行输入: 长文本或代码块会自动提示，按两次回车提交
-  • 取消输入: Ctrl+C
+  · 单行输入: 直接输入后回车
+  · 多行输入: 长文本或代码块会自动提示，按两次回车提交
+  · 取消输入: Ctrl+C
 """
         print(help_text)
 
@@ -479,15 +650,15 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
 {UI.section('ReviewAgent 数据统计')}
 
 {bold('训练数据库:')}
-  • 仓库数量: {colored('18', Style.GREEN)} 个 (PyTorch + MindSpore)
-  • Issues: {colored('733', Style.GREEN)} 个
-  • PRs: {colored('745', Style.GREEN)} 个
-  • 总数据量: {colored('25 MB', Style.GREEN)}
+  · 仓库数量: {colored('18', Style.GREEN)} 个 (PyTorch + MindSpore)
+  · Issues: {colored('733', Style.GREEN)} 个
+  · PRs: {colored('745', Style.GREEN)} 个
+  · 总数据量: {colored('25 MB', Style.GREEN)}
 
 {bold('本次会话:')}
-  • 开始时间: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}
-  • 对话轮次: {len(self.conversation_history) // 2}
-  • AI 服务: {colored(self._get_provider_name(), Style.CYAN)}
+  · 开始时间: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}
+  · 对话轮次: {len(self.conversation_history) // 2}
+  · AI 服务: {colored(self._get_provider_name(), Style.CYAN)}
 """
         print(stats)
 
@@ -663,7 +834,10 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
             print("\r" + " " * 50 + "\r", end='', flush=True)
 
             # 格式化输出
-            print(f"\n{colored('ReviewAgent:', Style.BRIGHT_BLUE)} {response}\n")
+            print(
+                f"\n{colored(G.BAR, Style.BRAND)} {bold(colored('ReviewAgent', Style.BRAND))}\n"
+                f"{response}\n"
+            )
 
             # 保存历史
             self.conversation_history.append({"role": "user", "content": user_input})
@@ -715,8 +889,11 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
             if intent in ['review_code', 'review_request']:
                 self.handle_review_code(user_input)
             elif intent == 'fetch_url':
-                # 使用统一 fetcher
-                self.handle_fetch_and_review(entities['urls'])
+                # 使用统一 fetcher。
+                # 原来写的是 entities['urls']，但 entities 这个变量根本不存在
+                # （understand_intent 把链接放在返回值的 'urls' 里），
+                # 一旦走到这条分支就 NameError。改为从 intent_result 取。
+                self.handle_fetch_and_review(intent_result.get('urls') or [])
             elif intent == 'need_search':
                 # 明确的搜索请求
                 query = user_input.replace('搜索', '').replace('search', '').strip()
@@ -760,26 +937,26 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
 
         # 显示欢迎
         if show_banner:
-            print("\n" + "=" * 70)
             self.show_welcome()
-            print("=" * 70 + "\n")
         else:
             # 简化版欢迎
-            print("\n" + colored("快速开始:", Style.CYAN))
-            print("  • 直接粘贴代码进行审查")
-            print("  • 发送 GitHub/Gitee URL 分析 PR/Issue")
-            print("  • 提问昇腾 NPU 相关技术问题")
             print()
-            print(colored("命令:", Style.CYAN) + " /help /clear /config /stats /exit")
+            print(f"  {colored(G.BAR, Style.ACCENT)} {bold('快速开始')}")
+            print(UI.bullet('粘贴代码 → 直接审查'))
+            print(UI.bullet('发送 GitHub / Gitee 链接 → 分析 PR / Issue'))
+            print(UI.bullet('提问昇腾 NPU 相关问题'))
             print()
-            print(dim("提示: 多行输入请按两次回车提交"))
+            print(f"  {colored(G.BAR, Style.ACCENT)} {bold('命令')}  "
+                  + dim('/help /clear /config /stats /exit'))
+            print()
+            print(f"  {dim('提示：多行内容按两次回车提交')}")
             print()
 
         # 主循环
         while True:
             try:
                 # 提示符
-                prompt = f"{colored('You', Style.BRIGHT_CYAN)}{colored('>', Style.DIM)} "
+                prompt = f"  {colored(G.PROMPT, Style.ACCENT)} "
 
                 # 读取第一行
                 first_line = input(prompt).strip()
@@ -827,6 +1004,7 @@ ReviewAgent 需要连接 AI 服务来提供智能审查。
 
 def main():
     """主函数"""
+    _configure_console()
     try:
         agent = ReviewAgentChat()
         agent.run()

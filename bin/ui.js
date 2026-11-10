@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { chalk, c, sleep } = require('./ui-colors');
+const tf = require('./term-frame');
 
 let boxen, ora;
 try {
@@ -13,6 +14,45 @@ try {
 } catch {
   boxen = (s) => s;
   ora = () => ({ start() { return this; }, succeed() {}, fail() {}, stop() {} });
+}
+
+/**
+ * 画一张圆角卡片 —— 不用 boxen。
+ *
+ * boxen 内部用 `string-width`，它把 EAW=A 的字符（● · → ◆ …）一律算 2 列，
+ * 而中文 Windows 控制台对其中一部分按 1 列画 → 右边框被顶出框外。
+ * 改成用 ./term-frame 自己画，宽度和 Python 侧完全同一套算法。
+ *
+ * @param {string} title   标题，空字符串表示不要标题行
+ * @param {string} body    正文，可含 \n；已带颜色的字符串原样保留
+ * @param {string} color   'cyan' | 'magenta'，影响边框亮度
+ */
+function frameCard(title, body, color = 'cyan') {
+  const total = tf.totalWidth();
+  const paint = color === 'magenta' ? c.accent : c.mute;
+  const lines = [paint(tf.topBorder('', total))];
+
+  if (title) {
+    const safe = tf.frameSafe(title);
+    const rendered = c.brand(safe);
+    const tw = tf.displayWidth(safe);
+    const inner = total - 2;
+    const left = Math.max(Math.floor((inner - tw) / 2), 0);
+    const right = Math.max(inner - left - tw, 0);
+    lines.push(paint('│') + ' '.repeat(left) + rendered + ' '.repeat(right) + paint('│'));
+    lines.push(paint('├' + '─'.repeat(inner) + '┤'));
+  }
+
+  for (const raw of String(body == null ? '' : body).split('\n')) {
+    for (const row of tf.rowLines(raw, total)) lines.push(paint(row));
+  }
+
+  lines.push(paint(tf.bottomBorder('', total)));
+
+  if ((process.env.REVIEWAGENT_FRAME_DEBUG || '') === '1') {
+    tf.checkFrame(title, lines.map((l) => tf.stripAnsi(l)), total);
+  }
+  return lines.join('\n');
 }
 
 const { interactPet, ensureHatched, animateIdle, renderFace } = require('./buddy');
@@ -154,20 +194,13 @@ async function splash({ firstRun = false, withPet = true } = {}) {
   }
 
   const body = firstRun
-    ? `${c.accent('✦ 第一次见面')}  ·  接下来会引导你配置 API\n` +
+    ? `${c.accent('✦ 第一次见面')}  ${c.mute('-')}  接下来会引导你配置 API\n` +
       `${c.mute('昇腾算子 / 推理 / CANN · 兼容 cc-switch')}`
     : `${c.ok('●')} ${c.ink('就绪')}  ${c.mute('问题或 PR/Issue URL · /help · /exit')}\n` +
       `${c.mute('review · search · config · doctor · model')}`;
 
-  console.log(
-    boxen(body, {
-      padding: { top: 0, bottom: 0, left: 1, right: 1 },
-      margin: { top: 0, bottom: 1, left: 1, right: 1 },
-      borderStyle: 'round',
-      borderColor: firstRun ? 'magenta' : 'cyan',
-      dimBorder: true,
-    }),
-  );
+  console.log(frameCard('', body, firstRun ? 'magenta' : 'cyan'));
+  console.log();
 }
 
 function spinner(text) {
@@ -191,4 +224,6 @@ module.exports = {
   sleep,
   chalk,
   boxen,
+  tf,
+  frameCard,
 };

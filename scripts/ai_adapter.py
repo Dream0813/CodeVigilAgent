@@ -4,32 +4,118 @@
 """
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 import urllib.request
 import urllib.parse
 
+# "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v3.2."
+_SUPPORTED_RE = re.compile(r'supported API model names are\s+(.+?)(?:\s*,\s*but you passed|\s*\.|$)', re.I)
+_PASSED_RE = re.compile(r'but you passed\s+(\S+)', re.I)
+
+
+def _probe_body(body: str) -> Dict[str, str]:
+    """从错误响应里抽出 type / message，取不到就返回空串。"""
+    try:
+        data = json.loads(body)
+    except Exception:
+        return {}
+    err = data.get('error') if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return {
+            'type': str(err.get('type') or err.get('code') or ''),
+            'message': str(err.get('message') or ''),
+        }
+    if isinstance(data, dict):
+        return {'type': '', 'message': str(data.get('message') or '')}
+    return {}
+
 
 def _format_http_error(exc) -> str:
-    """Surface provider error body (400 reason) instead of bare HTTP Error 400."""
+    """Surface provider error body (400 reason) instead of bare HTTP Error 400.
+
+    400 且能解析出"支持模型列表"时，直接给出可操作的修复步骤，
+    而不是把整段 JSON 糊在屏幕上（那串 JSON 会撑爆边框）。
+    """
     import urllib.error
-    if isinstance(exc, urllib.error.HTTPError):
+    if not isinstance(exc, urllib.error.HTTPError):
+        return f'Error: {exc}'
+    body = ''
+    try:
+        raw = exc.read()
+        body = raw.decode('utf-8', errors='replace')[:800] if raw else ''
+    except Exception:
         body = ''
-        try:
-            raw = exc.read()
-            body = raw.decode('utf-8', errors='replace')[:800] if raw else ''
-        except Exception:
-            body = ''
-        hint = ''
-        lower = (body + str(exc.reason)).lower()
-        model_hint = ''
-        if 'vl' in lower or 'vision' in lower or 'image' in lower:
-            model_hint = '（当前模型可能是视觉/多模态，对话请改用文本模型，如 MiniMax-Text-01 / MiniMax-M1）'
-        if exc.code == 400:
-            hint = model_hint or '（常见原因：模型 ID 不支持 chat、参数不兼容、或 base_url 不对）'
-        detail = f' — {body}' if body else ''
-        return f'Error: HTTP {exc.code} {exc.reason}{detail}{hint}'
-    return f'Error: {exc}'
+
+    probed = _probe_body(body)
+    message = probed.get('message') or body
+    err_type = probed.get('type') or ''
+
+    supported: List[str] = []
+    m = _SUPPORTED_RE.search(message)
+    if m:
+        supported = [s.strip() for s in re.split(r'[,/、]', m.group(1)) if s.strip()]
+    passed = ''
+    pm = _PASSED_RE.search(message)
+    if pm:
+        passed = pm.group(1).rstrip('.,;:')
+
+    if supported:
+        head = f'Error: HTTP {exc.code}'
+        if err_type:
+            head += f' {err_type}'
+        lines = [head]
+        if passed:
+            lines.append(f'  服务端不认识模型 ID「{passed}」')
+        else:
+            lines.append('  服务端不认识当前模型 ID')
+        lines.append(f'  现在可用：{" / ".join(supported)}')
+        lines.append('  修复：跑 reviewagent config -w 重选模型，'
+                     '或把本机配置里的 "model" 改成上面任一名字')
+        lines.append(f'  原始响应：{message[:180]}')
+        return '\n'.join(lines)
+
+    lower = (body + str(exc.reason)).lower()
+    hint = ''
+    if 'vl' in lower or 'vision' in lower or 'image' in lower:
+        hint = '（当前模型可能是视觉/多模态，对话请改用文本模型，如 MiniMax-Text-01 / MiniMax-M1）'
+    if exc.code == 400:
+        hint = hint or '（常见原因：模型 ID 不支持 chat、参数不兼容、或 base_url 不对）'
+    detail = f' — {body}' if body else ''
+    return f'Error: HTTP {exc.code} {exc.reason}{detail}{hint}'
+
+
+def _extract_content(result: Dict, model: str = '') -> str:
+    """取回复正文。
+
+    推理型模型（deepseek-flash 等）会把 max_tokens 先用在 reasoning 上，
+    额度不够时正文直接是空字符串 —— 直接返回 '' 会让界面显示一个空盒子，
+    所以这里给出可读的原因。
+    """
+    try:
+        choice = (result.get('choices') or [{}])[0]
+    except Exception:
+        return ''
+    msg = choice.get('message') or {}
+    content = msg.get('content')
+    if isinstance(content, list):  # 部分网关把正文分段返回
+        parts = []
+        for seg in content:
+            parts.append(str(seg.get('text', '')) if isinstance(seg, dict) else str(seg))
+        content = ''.join(parts)
+    content = (content or '').strip()
+    if content:
+        return content
+    usage = result.get('usage') or {}
+    reasoning = (usage.get('completion_tokens_details') or {}).get('reasoning_tokens') or 0
+    finish = choice.get('finish_reason')
+    if reasoning and finish == 'length':
+        return (f'（正文为空：max_tokens 被推理过程用掉了 {reasoning} tokens。'
+                f'把 max_tokens 调大，或换非推理模型。）')
+    if finish == 'length':
+        return '（正文为空：回复被 max_tokens 截断，请调大 max_tokens。）'
+    return ''
 
 
 def _post_json(url: str, headers: Dict, data: Dict, timeout: int = 60) -> Dict:
@@ -88,7 +174,7 @@ class DeepSeekProvider(AIProvider):
 
         try:
             result = _post_json(self.get_api_url(), headers, data)
-            return result['choices'][0]['message']['content']
+            return _extract_content(result, self.model)
         except Exception as e:
             return str(e) if str(e).startswith('Error:') else f'Error: {e}'
 
@@ -126,7 +212,7 @@ class OpenAIProvider(AIProvider):
 
         try:
             result = _post_json(self.get_api_url(), headers, data)
-            return result['choices'][0]['message']['content']
+            return _extract_content(result, self.model)
         except Exception as e:
             return str(e) if str(e).startswith('Error:') else f'Error: {e}'
 
@@ -199,7 +285,7 @@ class GLMProvider(AIProvider):
 
         try:
             result = _post_json(self.get_api_url(), headers, data)
-            return result['choices'][0]['message']['content']
+            return _extract_content(result, self.model)
         except Exception as e:
             return str(e) if str(e).startswith('Error:') else f'Error: {e}'
 

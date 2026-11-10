@@ -2,7 +2,7 @@
  * First-run API setup wizard (Claude Code–style guided onboarding).
  */
 const fs = require('fs');
-const { homeDir, configPath, readConfig, c, boxen, spinner, sleep } = require('./ui');
+const { homeDir, configPath, readConfig, c, boxen, spinner, sleep, tf, frameCard } = require('./ui');
 const { react } = require('./buddy');
 
 let inquirer;
@@ -12,23 +12,42 @@ try {
   inquirer = null;
 }
 
-/** OpenAI-compatible catalogs (saved as provider=openai + base_url). */
+// 字形降级：conhost + 宋体不含 ✦ ❯ ✕ ✎ › ✓，会显示成方块 □
+// 用 REVIEWAGENT_GLYPHS=fancy|safe 可强制指定
+const FANCY = (() => {
+  const o = String(process.env.REVIEWAGENT_GLYPHS || '').toLowerCase();
+  if (o === 'fancy') return true;
+  if (o === 'safe') return false;
+  if (process.platform !== 'win32') return true;
+  // Windows 一律保守：终端类型判断不可靠，用户也可能给 WT 配了宋体。
+  // 想用花哨符号：set REVIEWAGENT_GLYPHS=fancy
+  return false;
+})();
+
+const G = {
+  spark: FANCY ? '✦' : '◆',
+  prompt: FANCY ? '❯' : '>',
+  close: FANCY ? '✕' : '×',
+  pencil: FANCY ? '✎' : '·',
+  sep: FANCY ? '›' : '>',
+  ok: FANCY ? '✓' : '√',
+};
+
+/**
+ * OpenAI-compatible catalogs (saved as provider=openai + base_url).
+ *
+ * 2026-11 校准：DeepSeek 官方已下线 deepseek-chat / deepseek-reasoner / deepseek-v3.x，
+ * 现在只接受 deepseek-flash 与 deepseek-v4-pro（其他名字会返回
+ * HTTP 400 invalid_request_error）。列表里不要再放旧名字，否则用户选了必崩。
+ */
 const PROVIDERS = [
   {
     name: 'DeepSeek',
     value: 'deepseek',
     hint: 'platform.deepseek.com',
     models: [
-      'deepseek-chat',
-      'deepseek-reasoner',
-      'deepseek-coder',
-      'deepseek-v3',
-      'deepseek-v3.1',
-      'deepseek-v3.2',
-      'deepseek-r1',
-      'deepseek-r1-0528',
-      'deepseek-r1-distill-qwen-32b',
-      'deepseek-r1-distill-llama-70b',
+      'deepseek-flash',
+      'deepseek-v4-pro',
     ],
   },
   {
@@ -280,23 +299,103 @@ function normalizeProvider(provider, meta) {
   return { fileProvider: provider, logical: provider };
 }
 
-async function runOnboarding() {
+// ---------------------------------------------------------------------------
+// 向导视觉小工具（美化层：清屏 + 步骤条 + 已选摘要）
+// ---------------------------------------------------------------------------
+
+const BACK = '__back__';
+const EXIT = '__exit__';
+
+/**
+ * 输入屏（自定义模型 / base_url / API Key）是文本框，inquirer 塞不进"可选中项"，
+ * 所以约定两个词：< 退回上一步，q 退出配置。
+ * 两条出路都直接写在提示行里，不让人猜。
+ */
+const QUIT_TOKENS = new Set(['q', 'quit', 'exit', '退出', '放弃']);
+const INPUT_HINT = () => c.mute('   · < 退回上一步   · q 退出配置（不写入）');
+
+function isQuitInput(v) {
+  return QUIT_TOKENS.has(String(v || '').trim().toLowerCase());
+}
+
+/**
+ * 全局 Esc = 退出配置。
+ * 文本框屏没有任何列表可选，但 Esc 是所有终端里通行的"取消"键，
+ * 一个键就能脱身，不用记着 Ctrl+C。
+ * 返回卸载函数；非 TTY（重定向、CI）时什么都不做。
+ */
+function attachEsc(onCancel) {
+  if (!process.stdin.isTTY) return () => {};
+  const handler = (chunk, key) => {
+    if (key && key.name === 'escape') onCancel();
+  };
+  try {
+    require('readline').emitKeypressEvents(process.stdin);
+    process.stdin.on('keypress', handler);
+  } catch {
+    return () => {};
+  }
+  return () => {
+    try {
+      process.stdin.removeListener('keypress', handler);
+    } catch {
+      /* 忽略：stdin 已关闭 */
+    }
+  };
+}
+
+/** 清屏（TTY 才清，重定向到文件时保持原文，方便抓取对比图） */
+function clearScreen() {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write('\x1b[2J\x1b[H');
+}
+
+/** 把已选项目压成一行 chips */
+function pairLine(pairs) {
+  if (!pairs.length) return c.mute('还没有选择任何项目');
+  return pairs.map(([k, v]) => `${c.mute(k)} ${c.brand(v)}`).join(c.mute('  ' + G.sep + '  '));
+}
+
+/** 每个步骤顶部的迷你横幅 */
+function wizardBanner(pairs, stepLabel) {
+  const bar = stepLabel ? `${c.accent(stepLabel)}  ${c.mute('─────')}  ` : '';
+  return (
+    `\n  ${c.accent(G.spark)} ${c.brand('ReviewAgent')} ${c.mute('配置向导')}    ${bar}\n` +
+    `  ${c.mute('已选')}  ${pairLine(pairs)}\n` +
+    `  ${c.mute(tf.hr())}\n`
+  );
+}
+
+function showWelcome() {
   console.log(
-    boxen(
-      `${c.accent('✦ 欢迎使用 ReviewAgent')}\n\n` +
+    frameCard(
+      '首次配置',
+      `${c.accent(G.spark + ' 欢迎使用 ReviewAgent')}\n\n` +
         `${c.mute('像 Claude Code 一样，先完成 API 配置。')}\n` +
-        `${c.mute('密钥只保存在本机')} ${c.brand(configPath())}\n` +
-        `${c.accent('buddy')} ${c.mute('会像 Claude Code 一样坐在旁边～')}`,
-      {
-        padding: 1,
-        margin: 1,
-        borderStyle: 'round',
-        borderColor: 'magenta',
-        title: '首次配置',
-        titleAlignment: 'center',
-      },
+        `${c.mute('密钥只保存在本机：')}${c.brand(configPath())}\n\n` +
+        `${c.brand('①')} ${c.mute('服务商')}    ${c.brand('②')} ${c.mute('模型')}    ` +
+        `${c.brand('③')} ${c.mute('密钥')}\n\n` +
+        `${c.mute('走错了怎么办')}\n` +
+        `  ${c.accent('← 返回上一步')}  ${c.mute('列表里选中，或输入')} ${c.accent('<')}\n` +
+        `  ${c.accent(G.close + ' 退出配置')}  ${c.mute('列表里选中，或按')} ${c.accent('Esc')}` +
+        `${c.mute('、输入')} ${c.accent('q')}\n` +
+        `  ${c.mute('怎么退都不写盘，密钥只存本机')}`,
+      'magenta',
     ),
   );
+}
+
+function cancelWizard() {
+  console.log();
+  console.log(
+    `  ${c.warn(G.close + ' 已取消配置')}  ${c.mute('没有写入任何设置，下次运行会重新询问。')}`,
+  );
+  console.log();
+  return false;
+}
+
+async function runOnboarding() {
+  showWelcome();
 
   if (!inquirer) {
     console.log(c.warn('缺少 inquirer，请运行: npm install'));
@@ -304,75 +403,211 @@ async function runOnboarding() {
     return false;
   }
 
-  const { provider } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'provider',
-      message: c.brand('选择模型提供商'),
-      pageSize: 16,
-      choices: PROVIDERS.map((p) => ({
-        name: `${p.name}  ${c.mute(p.hint)}`,
-        value: p.value,
-      })),
-    },
-  ]);
+  let provider = null;
+  let meta = null;
+  let model = null;
+  let base_url = '';
+  let api_key = '';
+  let stage = 'provider';
 
-  const meta = PROVIDERS.find((p) => p.value === provider);
-  const { modelPick } = await inquirer.prompt([
-    {
-      type: 'list',
-      name: 'modelPick',
-      message: c.brand('选择模型（可翻页）'),
-      pageSize: 16,
-      choices: [
-        ...meta.models.map((m) => ({ name: m, value: m })),
-        new inquirer.Separator(),
-        { name: c.mute('自定义输入…'), value: '__custom__' },
-      ],
-    },
-  ]);
+  // 退出统一出口：恢复光标 → 打印取消说明 → 以失败码退出
+  let leaving = false;
+  const bail = () => {
+    if (leaving) return;
+    leaving = true;
+    if (process.stdout.isTTY) process.stdout.write('\x1b[?25h');
+    cancelWizard();
+    process.exit(1);
+  };
+  const detachEsc = attachEsc(bail);
+  const onSigint = () => bail();
+  process.once('SIGINT', onSigint);
 
-  let model = modelPick;
-  if (modelPick === '__custom__') {
-    const ans = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'model',
-        message: '自定义模型 ID（豆包等可填接入点 ep-xxx）',
-        validate: (v) => (!!String(v).trim() ? true : '不能为空'),
-      },
-    ]);
-    model = ans.model.trim();
+  // 内部退出（列表屏选中"退出配置"）：同一套收尾，但不强杀进程
+  const quit = () => {
+    detachEsc();
+    process.removeListener('SIGINT', onSigint);
+    return cancelWizard();
+  };
+
+  /** 需要填 base_url 的供应商多一步 */
+  const needsBase = (m) => Boolean(m && (m.openaiCompat || m.defaultBase));
+  const stepLabel = (n, m) =>
+    m ? `第 ${n} 步 / 共 ${needsBase(m) ? 4 : 3} 步` : `第 ${n} 步`;
+
+  const base = { pageSize: 16, loop: false, prefix: c.brand(G.prompt) };
+
+  while (true) {
+    // ---- 第 1 步：服务商 ----------------------------------------------------
+    if (stage === 'provider') {
+      clearScreen();
+      process.stdout.write(wizardBanner([], stepLabel(1)));
+      const { pick } = await inquirer.prompt([
+        {
+          ...base,
+          type: 'list',
+          name: 'pick',
+          message: c.brand('选择模型提供商') + c.mute('（↑↓ 移动，回车确认，Esc 退出）'),
+          choices: [
+            ...PROVIDERS.map((p) => ({
+              name: `${p.name}  ${c.mute(p.hint)}`,
+              value: p.value,
+            })),
+            new inquirer.Separator(),
+            { name: c.mute(G.close + '  退出配置（不写入）'), value: EXIT },
+          ],
+        },
+      ]);
+      if (pick === EXIT) return quit();
+      provider = pick;
+      meta = PROVIDERS.find((p) => p.value === provider);
+      stage = 'model';
+      continue;
+    }
+
+    // ---- 第 2 步：模型 ------------------------------------------------------
+    if (stage === 'model') {
+      clearScreen();
+      process.stdout.write(wizardBanner([['服务商', meta.name]], stepLabel(2, meta)));
+      const { pick } = await inquirer.prompt([
+        {
+          ...base,
+          type: 'list',
+          name: 'pick',
+          message:
+            c.brand('选择模型') + c.mute('（↑↓ 移动，回车确认，Esc 退出）'),
+          choices: [
+            ...meta.models.map((m) => ({ name: m, value: m })),
+            new inquirer.Separator(),
+            { name: c.mute(G.pencil + '  自定义模型 ID…'), value: '__custom__' },
+            { name: c.accent('←  返回上一步（重选服务商）'), value: BACK },
+            { name: c.mute(G.close + '  退出配置（不写入）'), value: EXIT },
+          ],
+        },
+      ]);
+      if (pick === BACK) {
+        stage = 'provider';
+        continue;
+      }
+      if (pick === EXIT) return quit();
+      if (pick === '__custom__') {
+        stage = 'modelCustom';
+        continue;
+      }
+      model = pick;
+      stage = meta.openaiCompat || meta.defaultBase ? 'base' : 'key';
+      continue;
+    }
+
+    // ---- 第 2 步补充：自定义模型 ID -----------------------------------------
+    if (stage === 'modelCustom') {
+      clearScreen();
+      process.stdout.write(wizardBanner([['服务商', meta.name]], stepLabel(2, meta)));
+      const ans = await inquirer.prompt([
+        {
+          prefix: c.brand(G.prompt),
+          type: 'input',
+          name: 'model',
+          message: c.brand('自定义模型 ID') + c.mute('（豆包等填接入点 ep-xxx）'),
+          suffix: INPUT_HINT(),
+          validate: (v) => {
+            const s = String(v || '').trim();
+            if (isQuitInput(s)) return true;
+            if (!s) return '不能为空（输入 < 返回，q 退出）';
+            return true;
+          },
+        },
+      ]);
+      const v = String(ans.model || '').trim();
+      if (isQuitInput(v)) return quit();
+      if (v === '<') {
+        stage = 'model';
+        continue;
+      }
+      model = v;
+      stage = meta.openaiCompat || meta.defaultBase ? 'base' : 'key';
+      continue;
+    }
+
+    // ---- 第 3 步（可能是最后一步）：base_url --------------------------------
+    if (stage === 'base') {
+      clearScreen();
+      process.stdout.write(
+        wizardBanner(
+          [
+            ['服务商', meta.name],
+            ['模型', model],
+          ],
+          stepLabel(3, meta),
+        ),
+      );
+      const ans = await inquirer.prompt([
+        {
+          prefix: c.brand(G.prompt),
+          type: 'input',
+          name: 'base_url',
+          message: c.brand('OpenAI 兼容 base_url'),
+          default: meta.defaultBase || 'https://api.openai.com/v1',
+          suffix: INPUT_HINT(),
+        },
+      ]);
+      const v = String(ans.base_url || '').trim();
+      if (isQuitInput(v)) return quit();
+      if (v === '<') {
+        stage = 'model';
+        continue;
+      }
+      base_url = v;
+      stage = 'key';
+      continue;
+    }
+
+    // ---- 最后一步：API Key --------------------------------------------------
+    if (stage === 'key') {
+      clearScreen();
+      process.stdout.write(
+        wizardBanner(
+          [
+            ['服务商', meta.name],
+            ['模型', model],
+            ...(base_url ? [['base_url', base_url]] : []),
+          ],
+          stepLabel(base_url ? 4 : 3, meta),
+        ),
+      );
+      const { api_key: key } = await inquirer.prompt([
+        {
+          prefix: c.brand(G.prompt),
+          type: 'password',
+          name: 'api_key',
+          message:
+            c.brand('API Key') + c.mute('（输入时隐藏，粘贴后回车）'),
+          mask: FANCY ? '✦' : '*',
+          suffix: INPUT_HINT(),
+          validate: (v) => {
+            const s = String(v || '').trim();
+            if (isQuitInput(s) || s === '<') return true;
+            if (!s || s === 'YOUR_API_KEY_HERE')
+              return '请填写真实 API Key（输入 < 返回，q 退出）';
+            if (s.length < 8) return 'Key 太短，请检查（输入 < 返回，q 退出）';
+            return true;
+          },
+        },
+      ]);
+      const v = String(key || '').trim();
+      if (isQuitInput(v)) return quit();
+      if (v === '<') {
+        stage = base_url ? 'base' : 'model';
+        continue;
+      }
+      api_key = v;
+      break;
+    }
   }
 
-  const needsBase = !!(meta.openaiCompat || meta.defaultBase);
-  let base_url = meta.defaultBase || '';
-  if (needsBase) {
-    const ans = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'base_url',
-        message: 'OpenAI 兼容 base_url',
-        default: meta.defaultBase || 'https://api.openai.com/v1',
-      },
-    ]);
-    base_url = ans.base_url.trim();
-  }
-
-  const { api_key } = await inquirer.prompt([
-    {
-      type: 'password',
-      name: 'api_key',
-      message: 'API Key（输入时隐藏）',
-      mask: '✦',
-      validate: (v) => {
-        const s = String(v || '').trim();
-        if (!s || s === 'YOUR_API_KEY_HERE') return '请填写真实 API Key';
-        if (s.length < 8) return 'Key 太短，请检查';
-        return true;
-      },
-    },
-  ]);
+  // 收集完毕：摘掉 Esc / Ctrl+C 的取消钩子，避免写盘过程中被误触打断
+  detachEsc();
+  process.removeListener('SIGINT', onSigint);
 
   const spin = spinner('buddy 正在把配置藏进本机…');
   spin.start();
@@ -381,7 +616,7 @@ async function runOnboarding() {
   const saved = writeConfig({
     provider: fileProvider,
     model,
-    api_key: api_key.trim(),
+    api_key,
     base_url: base_url || '',
     label: provider,
   });
@@ -389,22 +624,19 @@ async function runOnboarding() {
   await react('hop');
 
   console.log(
-    boxen(
-      `${c.ok('✓ 配置完成')}  ${c.accent('buddy ★')}\n\n` +
-        `${c.mute('provider')}  ${provider} → ${fileProvider}\n` +
-        `${c.mute('model')}     ${model}\n` +
-        (base_url ? `${c.mute('base_url')}  ${base_url}\n` : '') +
+    frameCard(
+      '',
+      `${c.ok(G.ok + ' 配置完成')}   ${c.mute('改错了重新跑：')}${c.brand('reviewagent config -w')}\n\n` +
+        `${c.mute('服务商')}    ${c.brand(provider)} ${c.mute('→')} ${c.mute(fileProvider)}\n` +
+        `${c.mute('模型')}      ${c.brand(model)}\n` +
+        (base_url ? `${c.mute('base_url')}  ${c.mute(base_url)}\n` : '') +
+        `${c.mute('密钥')}      ${c.ok('已写入本机，不显示')}\n` +
         `\n${c.accent('正在启动 Agent…')}`,
-      {
-        padding: 1,
-        margin: { top: 1, bottom: 1, left: 1, right: 1 },
-        borderStyle: 'round',
-        borderColor: 'green',
-      },
+      'cyan',
     ),
   );
   await sleep(280);
   return true;
 }
 
-module.exports = { runOnboarding, writeConfig, PROVIDERS };
+module.exports = { runOnboarding, writeConfig, PROVIDERS, G };

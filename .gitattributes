@@ -1,0 +1,19 @@
+# 统一行尾：仓库里一律存 LF，按平台检出成合适的格式。
+# 没有这个文件时，core.autocrlf 的设置会让同一份代码在不同机器上得到不同的行尾，
+# 最典型的后果是 Mac 上跑 ./build-mac.sh 报 "bad interpreter: ^M"。
+* text=auto
+
+# Mac / Linux 脚本必须是 LF
+*.sh      text eol=lf
+*.command text eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# 二进制文件不做行尾转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.zip  binary
+*.ico  binary

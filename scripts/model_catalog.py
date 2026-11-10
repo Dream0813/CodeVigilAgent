@@ -12,11 +12,12 @@ CATALOG: List[Dict] = [
         'label': 'deepseek',
         'file_provider': 'deepseek',
         'base_url': '',
+        # 2026-11 校准：官方只接受 deepseek-flash / deepseek-v4-pro，
+        # 旧的 deepseek-chat / deepseek-reasoner / deepseek-v3.x 会 400。
         'models': [
-            'deepseek-chat', 'deepseek-reasoner', 'deepseek-coder',
-            'deepseek-v3', 'deepseek-v3.1', 'deepseek-r1', 'deepseek-r1-0528',
+            'deepseek-flash', 'deepseek-v4-pro',
         ],
-        'default_model': 'deepseek-chat',
+        'default_model': 'deepseek-flash',
         'aliases': ('deepseek',),
     },
     {

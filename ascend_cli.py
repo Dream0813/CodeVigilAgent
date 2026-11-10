@@ -1396,6 +1396,13 @@ def _acceptance_checklist(focus: str = '') -> str:
 
 
 def main() -> int:
+    # 最先兜住控制台编码：中文 Windows 的 cmd 默认 GBK，很多符号
+    # （✓ ✗ ⚠ ❯ ✦）不在里面，直接 print 会抛 UnicodeEncodeError 退出。
+    try:
+        from scripts.console_safe import harden_console
+        harden_console()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(
         prog="reviewagent",
         description="ReviewAgent — Ascend AI Infra 智能体（Hermes 风格唤醒）",

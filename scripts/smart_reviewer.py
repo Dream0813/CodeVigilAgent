@@ -10,10 +10,9 @@ import json
 import re
 from typing import Dict, List, Optional
 
-# 设置 Windows 控制台 UTF-8 编码
-if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+# 编码设置统一交给程序入口负责（chat_v2._configure_console / ascend_cli.main）。
+# 这里不能在模块级 reconfigure：本模块被 import 时会顺手把调用方的 stdout 编码
+# 改掉，结果是同一份输出前半段 GBK、后半段 UTF-8，混在一起变乱码。
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

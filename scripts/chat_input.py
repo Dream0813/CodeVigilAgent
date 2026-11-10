@@ -11,35 +11,14 @@ import shutil
 import sys
 import time
 
+from scripts import console_safe
+from scripts import term_frame as tf
 from scripts.term_style import accent, brand, colors_enabled, enable_windows_ansi, mute, ok
 
 
 def _frame_width():
-    try:
-        cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-    except OSError:
-        cols = 80
-    return max(40, min(cols - 2, 72))
-
-
-def _visible_len(text: str) -> int:
-    n = 0
-    for ch in text:
-        n += 2 if ord(ch) > 0x2E80 else 1
-    return n
-
-
-def _pad_row(text, width):
-    vis = _visible_len(text)
-    if vis > width:
-        out = ''
-        for ch in text:
-            trial = out + ch
-            if _visible_len(trial) > width - 1:
-                return out + '.'
-            out = trial
-        return out
-    return text + (' ' * (width - vis))
+    """盒子内部可用宽度（保留旧名字，供其它模块引用）。"""
+    return tf.content_width()
 
 
 def _can_box():
@@ -52,40 +31,37 @@ def _can_box():
 
 
 def print_input_frame(network='auto', chat_mode='auto', session_lane='chat'):
+    """输入提示框。宽度与思考面板、Agent 回复框共用同一套几何，竖线对齐。"""
     enable_windows_ansi()
-    inner_w = _frame_width()
-    tty = hasattr(sys.stdin, 'isatty') and sys.stdin.isatty()
+    total = tf.total_width()
     if chat_mode == 'auto':
         lane = '正式' if session_lane == 'work' else '日常'
-        mode_tag = f'AI调换→{lane}'
-        title_txt = f' * AI自动调换  · 当前{lane}'
+        # 箭头用 ASCII：→ 属"模糊宽度"字符，中文字体里按 2 列画，
+        # 会让这一行比边框宽一列。
+        mode_tag = f'AI调换->{lane}'
+        title_txt = f'AI自动调换 · 当前{lane}'
     else:
         mode_tag = {'chat': '钉住日常', 'work': '钉住正式'}.get(chat_mode, chat_mode)
         title_txt = {
-            'chat': ' * 日常对话（已钉住）',
-            'work': ' * 正式审查（已钉住）',
-        }.get(chat_mode, ' * 对话')
-    if sys.platform == 'win32' and _smart_input_wanted() and tty:
-        hint_txt = f' {mode_tag} · /skill · /mcp · /exit'
+            'chat': '日常对话（已钉住）',
+            'work': '正式审查（已钉住）',
+        }.get(chat_mode, '对话')
+    if sys.platform == 'win32' and _smart_input_wanted() and hasattr(sys.stdin, 'isatty') and sys.stdin.isatty():
+        hint_txt = f'{mode_tag} · /skill · /mcp · /exit'
     else:
-        hint_txt = f' {mode_tag} · /skill · /mcp · /paste · net={network}'
-    title = _pad_row(title_txt, inner_w)
-    hint = _pad_row(hint_txt, inner_w)
+        hint_txt = f'{mode_tag} · /skill · /mcp · /paste · net={network}'
+
     print()
-    if _can_box():
-        top, bot, v = '╭' + '─' * inner_w + '╮', '╰' + '─' * inner_w + '╯', '│'
-    else:
-        top, bot, v = '+' + '-' * inner_w + '+', '+' + '-' * inner_w + '+', '|'
-    try:
-        print(brand(top))
-        print(brand(v) + accent(title) + brand(v))
-        print(brand(v) + mute(hint) + brand(v))
-        print(brand(bot))
-    except UnicodeEncodeError:
-        print(brand('+' + '-' * inner_w + '+'))
-        print(brand('|') + accent(title) + brand('|'))
-        print(brand('|') + mute(hint) + brand('|'))
-        print(brand('+' + '-' * inner_w + '+'))
+    if not _can_box():
+        print(brand('+' + '-' * (total - 2) + '+'))
+        print(brand('| ') + accent(tf.pad_display(title_txt, total - 4)) + brand(' |'))
+        print(brand('| ') + mute(tf.pad_display(hint_txt, total - 4)) + brand(' |'))
+        print(brand('+' + '-' * (total - 2) + '+'))
+        return
+    print(brand(tf.top_border(title_txt, total)))
+    for line in tf.row_lines(mute(hint_txt), total, paint=brand):
+        print(line)
+    print(brand(tf.bottom_border('', total)))
 
 
 def _smart_input_wanted() -> bool:
@@ -148,11 +124,14 @@ def _drain_stdin_lines(idle_sec: float = 0.2, extend_sec: float = 0.1) -> list:
 
 
 def _read_paste_block():
+    total = tf.total_width()
     print()
-    print(ok('╭─ 多行粘贴 ──────────────────────────────────╮'))
-    print(ok('│ ') + mute('粘贴全文，然后单独一行输入 /send 发送'))
-    print(ok('│ ') + mute('/cancel 取消 · /exit 退出对话'))
-    print(ok('╰────────────────────────────────────────────╯'))
+    print(ok(tf.top_border('多行粘贴', total)))
+    for line in tf.row_lines(mute('粘贴全文，然后单独一行输入 /send 发送'), total, paint=ok):
+        print(line)
+    for line in tf.row_lines(mute('/cancel 取消 · /exit 退出对话'), total, paint=ok):
+        print(line)
+    print(ok(tf.bottom_border('', total)))
     lines = []
     while True:
         try:
@@ -191,6 +170,20 @@ def _insert_newline(buf: list) -> None:
     sys.stdout.write('\n')
     sys.stdout.flush()
     _emit_cont_prompt()
+
+
+def erase_sequence(text: str) -> str:
+    """生成「在终端里擦掉 text 这一个字符」所需的控制序列。
+
+    终端里一个字符占的列数不一定等于 1：汉字、全角标点占 2 列。
+    擦除必须按真实列数来 —— 只擦 1 列会留下半个字，看起来就是
+    「中文只能撤回一部分」。
+
+    序列含义（以两列为例）：左移 2 格 → 写 2 个空格盖住 → 再左移 2 格，
+    这样光标回到字符原来的起点，屏幕上该字符被完全抹掉。
+    """
+    cols = max(tf.display_width(text), 1)
+    return '\b' * cols + ' ' * cols + '\b' * cols
 
 
 def _read_escape_sequence() -> str:
@@ -317,10 +310,14 @@ def _read_windows_tty(prompt: str) -> str:
                     continue
                 removed = buf.pop()
                 if removed == '\n':
+                    # 删掉的是换行：光标已经在续行的提示符后面，终端没有
+                    # "反向折行"这种操作，退不回上一行的行末，只能打个标记。
                     sys.stdout.write('^H')
                     sys.stdout.flush()
                 else:
-                    sys.stdout.write('\b \b')
+                    # 一个字符占的列数不一定等于 1（汉字/全角标点是 2 列），
+                    # 必须按真实宽度擦，否则屏幕会剩半个字。
+                    sys.stdout.write(erase_sequence(removed))
                     sys.stdout.flush()
                 continue
 
@@ -394,7 +391,9 @@ def read_message(multiline=False, network='auto', chat_mode='auto', session_lane
     # Do NOT disable bracketed paste here — Windows smart reader needs it for multiline Ctrl+V.
 
     print_input_frame(network=network, chat_mode=chat_mode, session_lane=session_lane)
-    prompt = (brand('❯ ') if colors_enabled() else '> ')
+    # ❯ 不在 GBK 里，中文 Windows 的 cmd 直接 print 会抛 UnicodeEncodeError。
+    # 按当前编码选字形：UTF-8 用 ❯，GBK 退回 >。
+    prompt = (brand(console_safe.glyph('❯', '>') + ' ') if colors_enabled() else '> ')
 
     # Explicit multiline flag → /send protocol via input()
     # (smart Windows path enables bracketed paste itself; do not force it off here)

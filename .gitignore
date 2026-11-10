@@ -78,3 +78,10 @@ Thumbs.db
 # Reports (generated files)
 # data/analyzed/
 # data/reports/
+
+# Local-only entry points (start-fresh.bat creates this folder on every run)
+reviewagent-fresh/
+reviewagent-fresh.old.*/
+
+# macOS desktop build output
+desktop-app/build/

@@ -109,6 +109,119 @@ private final class ReaderCompletion {
     }
 }
 
+// MARK: - 输出区排版
+//
+// 输出区显示的是终端文本，里面有框线（╭ ─ │ ╯）、缩进和箭头，必须严格按
+// 「一个字符一格」排。原来用 .systemFont(ofSize: 14)，那是 SF Pro，**比例字体**，
+// 每个字母宽度都不一样，于是：
+//   1. 框线竖线落在汉字的笔画中间 —— 看起来就是「中文字体重合」；
+//   2. 汉字比拉丁字母高，NSTextView 按拉丁字体算行高，中文上下会被压到相邻行；
+//   3. 中英文混排时左右边界参差不齐，一行的右边框能跑到另一行的边框外面。
+//
+// 这里统一成：
+//   西文 12pt SF Mono（等宽，1 格）+ 汉字「正好两格宽」的字号 + 固定行高。
+private enum TerminalStyle {
+    /// 西文等宽字体。所有字符同宽，这是字符网格的地基。
+    static let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    static let monoBold = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+
+    /// 一个西文字符的宽度。等宽字体里所有字符同宽，测一个 "M" 就够。
+    static let cell: CGFloat = ("M" as NSString).size(withAttributes: [.font: mono]).width
+
+    /// 汉字 / 全角标点用的字体：字号放大到「正好两格」。
+    /// 汉字在终端里本来就占两格，用 1em 的字号渲染会永远对不齐框线。
+    static let cjk: NSFont = {
+        let size = max(cell * 2, 13)
+        // 先写 PostScript 名（最可靠），再写 family 名兜底。
+        let candidates = ["PingFangSC-Regular", "PingFang SC",
+                          "HiraginoSansGB-W3", "Hiragino Sans GB",
+                          "Heiti SC", "Songti SC"]
+        for name in candidates {
+            if let font = NSFont(name: name, size: size) { return font }
+        }
+        // 系统里没有中文字体时退回默认，至少不会崩。
+        return NSFont.systemFont(ofSize: size)
+    }()
+
+    /// 固定行高。取两种字体里更高的那个再留 4pt 余量。
+    /// 不锁定行高的话，含汉字的行会比纯英文行高，行与行之间就会挤在一起。
+    static let lineHeight: CGFloat = {
+        let latin = mono.ascender - mono.descender + mono.leading
+        let han = cjk.ascender - cjk.descender + cjk.leading
+        return ceil(max(latin, han)) + 4
+    }()
+
+    static func paragraph() -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = lineHeight
+        style.maximumLineHeight = lineHeight
+        style.lineBreakMode = .byWordWrapping
+        return style
+    }
+
+    /// 需要占两格的字符：汉字、全角标点、谚文、假名、CJK 符号，
+    /// 外加几个在中文终端里同样按两列排的符号（中点 ·、省略号 …、箭头 →）。
+    ///
+    /// 这份规则必须和 Python 侧 scripts/term_frame.char_width 保持一致 ——
+    /// 输出文本里的空格数是 CLI 按那套规则补好的，这里若少算一格，
+    /// 整行就会短一格，右边框会往左缩。
+    ///
+    /// 制表符 ╭─│╯（U+2500 段）刻意**不**算两格，它们在等宽字体里本来就是 1 格；
+    /// 勾 ✓ 叉 ✗ 也是 1 格，和终端一致。
+    static func isDoubleWidth(_ code: unichar) -> Bool {
+        switch code {
+        case 0x00B4, 0x00B7,               // ´ · 中点
+             0x00D7,                       // × 乘号
+             0x2013, 0x2014,               // – — 连接号
+             0x2026,                       // … 省略号
+             0x2460...0x2463,              // ①②③④
+             0x2580...0x258F,              // ▌█ 方块（进度条、章节符号）
+             0x25C6, 0x25C7,               // ◆ ◇
+             0x25CB, 0x25CF,               // ○ ●
+             0x2605, 0x2606,               // ★ ☆
+             0x2665,                       // ♥
+             0x2705,                       // ✅
+             0x2190...0x2199,              // ← ↑ → ↓ 等箭头
+             0x1100...0x115F,              // 谚文字母
+             0x2E80...0x2FDF,              // CJK 部首
+             0x2FF0...0x303E,              // 表意文字描述符 / CJK 符号与标点
+             0x3041...0x33FF,              // 假名、注音、CJK 兼容
+             0x3400...0x4DBF,              // CJK 扩展 A
+             0x4E00...0x9FFF,              // CJK 基本区（常用汉字）
+             0xA000...0xA4CF,              // 彝文
+             0xAC00...0xD7A3,              // 谚文音节
+             0xF900...0xFAFF,              // CJK 兼容表意文字
+             0xFE10...0xFE19,              // 竖排标点
+             0xFE30...0xFE6F,              // CJK 兼容形式
+             0xFF01...0xFF60,              // 全角 ASCII / 全角标点
+             0xFFE0...0xFFE6:              // 全角符号
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 把一段纯文本包成「西文等宽 + 汉字双倍宽 + 固定行高」的富文本。
+    static func attributed(_ text: String, color: NSColor, bold: Bool) -> NSAttributedString {
+        let base: [NSAttributedString.Key: Any] = [
+            .font: bold ? monoBold : mono,
+            .foregroundColor: color,
+            .paragraphStyle: paragraph(),
+        ]
+        let result = NSMutableAttributedString(string: text, attributes: base)
+        let ns = text as NSString
+        var index = 0
+        while index < ns.length {
+            if isDoubleWidth(ns.character(at: index)) {
+                result.addAttribute(.font, value: cjk,
+                                    range: NSRange(location: index, length: 1))
+            }
+            index += 1
+        }
+        return result
+    }
+}
+
 final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                     NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
@@ -184,12 +297,18 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
         let header = NSStackView(views: [title, subtitle, statusLabel])
         header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 12
-        header.setCustomSpacing(18, after: subtitle)
+        // 25pt 英文和 13pt 中文按 centerY 对齐时，汉字会浮在英文上半部，
+        // 看起来像「压在标题上」。按最后一行基线对齐才自然。
+        header.alignment = .lastBaseline
+        header.spacing = 14
+        header.setCustomSpacing(22, after: subtitle)
         title.setContentHuggingPriority(.required, for: .horizontal)
-        subtitle.setContentHuggingPriority(.required, for: .horizontal)
+        // 副标题允许被压缩并显示省略号：窗口收窄时三个标签不会挤成一团。
+        subtitle.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        subtitle.lineBreakMode = .byTruncatingTail
         statusLabel.setContentHuggingPriority(.required, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         repositoryField.placeholderString = "选择要审查的 Git 仓库目录"
         repositoryField.font = .systemFont(ofSize: 13)
@@ -222,17 +341,38 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
 
         outputView.isEditable = false
         outputView.isSelectable = true
-        outputView.font = .systemFont(ofSize: 14)
+        outputView.font = TerminalStyle.mono
         outputView.textColor = NSColor(calibratedWhite: 0.95, alpha: 1)
         outputView.backgroundColor = NSColor(calibratedWhite: 0.035, alpha: 1)
-        outputView.textContainerInset = NSSize(width: 16, height: 16)
-        outputView.string = "欢迎使用 CodeVigil Agent。\n选择 Git 仓库以审查改动；使用 AI 前请在模型设置中填写 API 信息。\n\n"
+        outputView.textContainerInset = NSSize(width: 16, height: 12)
+        // 默认段落样式 + 输入属性都换成统一行高，否则每段 append 进来的文本
+        // 会各自按自己的字体算行高，行距忽大忽小。
+        outputView.defaultParagraphStyle = TerminalStyle.paragraph()
+        outputView.typingAttributes = [
+            .font: TerminalStyle.mono,
+            .foregroundColor: NSColor(calibratedWhite: 0.95, alpha: 1),
+            .paragraphStyle: TerminalStyle.paragraph(),
+        ]
+        // NSTextView 放进 NSScrollView 时必须显式声明「宽跟随、高自由」。
+        // 不声明的话 textContainer 宽度可能是 0，文字会被挤成一列、互相重叠。
+        outputView.minSize = NSSize(width: 0, height: 0)
+        outputView.maxSize = NSSize(width: .greatestFiniteMagnitude,
+                                    height: .greatestFiniteMagnitude)
+        outputView.isVerticallyResizable = true
+        outputView.isHorizontallyResizable = false
+        outputView.autoresizingMask = [.width]
+        outputView.textContainer?.lineFragmentPadding = 0
+        outputView.textContainer?.widthTracksTextView = true
+        outputView.string = ""
 
         let scrollView = NSScrollView()
         scrollView.documentView = outputView
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        appendOutput("欢迎使用 CodeVigil Agent。\n")
+        appendOutput("选择 Git 仓库以审查改动；使用 AI 前请在模型设置中填写 API 信息。\n\n")
 
         promptField.placeholderString = "输入问题，例如：分析这个仓库最近的改动"
         promptField.font = .systemFont(ofSize: 13)
@@ -1160,12 +1300,9 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     private func appendOutput(_ text: String, color: NSColor? = nil, bold: Bool = false) {
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: bold ? NSFont.systemFont(ofSize: 14, weight: .semibold) :
-                (outputView.font ?? NSFont.systemFont(ofSize: 14)),
-            .foregroundColor: color ?? outputView.textColor ?? NSColor.white,
-        ]
-        outputView.textStorage?.append(NSAttributedString(string: text, attributes: attributes))
+        guard let storage = outputView.textStorage else { return }
+        let ink = color ?? outputView.textColor ?? NSColor.white
+        storage.append(TerminalStyle.attributed(text, color: ink, bold: bold))
         outputView.scrollToEndOfDocument(nil)
     }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, List
 
+from scripts import term_frame as tf
 from scripts.term_style import accent, brand, c, colors_enabled, mute, ok, warn
 
 
@@ -33,10 +34,29 @@ def _inline(text: str) -> str:
     return text
 
 
-def render_markdown(md: str, width: int = 72) -> List[str]:
-    """Return list of ANSI-colored lines ready to print inside a box."""
+def _code_fence_top(label: str, inner: int) -> str:
+    """`┌─ label ─────┐`，总宽刚好 inner。"""
+    seg = f' {label} ' if label else ''
+    if not seg:
+        return mute('┌' + '─' * (inner - 2) + '┐')
+    line = '┌─' + seg + '─' * max(1, inner - 3 - tf.display_width(seg)) + '┐'
+    diff = inner - tf.display_width(line)
+    if diff > 0:
+        line = line[:-1] + '─' * diff + line[-1]
+    elif diff < 0:
+        line = line[:len(line) - 1 + diff] + line[-1]
+    return mute(line)
+
+
+def render_markdown(md: str, width: int = 0) -> List[str]:
+    """Return list of ANSI-colored lines ready to print inside a box.
+
+    行内不折行 —— 交给 term_frame.row_lines 统一按显示宽度折行并补齐，
+    这样中文、英文、长 URL 都不会把右边框顶歪。
+    """
     if not md:
         return ['(empty)']
+    inner = width or tf.content_width()
     out: List[str] = []
     in_code = False
     code_lang = ''
@@ -47,39 +67,40 @@ def render_markdown(md: str, width: int = 72) -> List[str]:
             if not in_code:
                 in_code = True
                 code_lang = line[3:].strip()
-                label = f' code {code_lang} '.rstrip()
-                out.append(mute('┌' + '─' * max(8, width - 2) + '┐'))
-                if code_lang:
-                    out.append(mute('│') + warn(label) + mute(''))
+                out.append(_code_fence_top(('code ' + code_lang).strip(), inner))
             else:
                 in_code = False
-                out.append(mute('└' + '─' * max(8, width - 2) + '┘'))
+                out.append(mute('└' + '─' * (inner - 2) + '┘'))
             continue
 
         if in_code:
-            out.append(mute('│ ') + c('92', line))
+            # 代码行在嵌套小框里按宽度折行，右侧也补上竖线
+            for part in tf.wrap_display(line, max(1, inner - 4)):
+                out.append(
+                    mute('│ ') + c('92', tf.pad_display(part, inner - 3)) + mute('│')
+                )
             continue
 
         # headings
         if line.startswith('### '):
             out.append('')
             out.append(accent('▸ ') + c('1;95', line[4:].strip()))
-            out.append(mute('  ' + '─' * min(40, width - 4)))
+            out.append(mute('  ' + '─' * min(40, inner - 2)))
             continue
         if line.startswith('## '):
             out.append('')
             out.append(brand('◆ ') + c('1;96', line[3:].strip()))
-            out.append(mute('  ' + '═' * min(44, width - 4)))
+            out.append(mute('  ' + '═' * min(44, inner - 2)))
             continue
         if line.startswith('# '):
             out.append('')
             out.append(ok('★ ') + c('1;92', line[2:].strip()))
-            out.append(mute('  ' + '═' * min(48, width - 4)))
+            out.append(mute('  ' + '═' * min(48, inner - 2)))
             continue
 
         # hr
         if re.fullmatch(r'-{3,}|\*{3,}|_{3,}', line.strip()):
-            out.append(mute('  ' + '─' * min(48, width - 4)))
+            out.append(mute('  ' + '─' * min(48, inner - 2)))
             continue
 
         # blockquote
@@ -116,25 +137,28 @@ def render_markdown(md: str, width: int = 72) -> List[str]:
 
 
 def print_markdown_box(md: str, title: str = 'Agent') -> None:
-    """Print markdown inside a green rounded box with rendered formatting."""
+    """Print markdown inside a green rounded box with rendered formatting.
+
+    盒子总宽取自 term_frame（和输入框、思考面板一致），
+    每行都补齐到同一列，所以右边框是一条直线，长内容自动折行。
+    """
     from scripts.term_style import enable_windows_ansi
     enable_windows_ansi()
-    lines = render_markdown(md)
-    width = 58
-    top = f"╭─ {title} " + '─' * max(4, width - len(title) - 4) + '╮'
-    bot = '╰' + '─' * width + '╯'
+    total = tf.total_width()
+    lines = render_markdown(md, tf.content_width(total))
     print()
     try:
-        print(ok(top))
+        print(ok(tf.top_border(title, total)))
         for line in lines:
-            # avoid breaking on very long lines — still prefix bar
-            print(ok('│ ') + (line if colors_enabled() else _strip_ansi(line)))
-        print(ok(bot))
+            body = line if colors_enabled() else _strip_ansi(line)
+            for wrapped in tf.row_lines(body, total, paint=ok):
+                print(wrapped)
+        print(ok(tf.bottom_border('', total)))
     except UnicodeEncodeError:
-        print(ok(f'+-- {title} ' + '-' * 40))
+        print(ok(f'+-- {title} ' + '-' * max(4, total - 8 - len(title)) + '+'))
         for line in lines:
             print(_strip_ansi(line))
-        print(ok('+' + '-' * 50))
+        print(ok('+' + '-' * (total - 2) + '+'))
 
 
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')

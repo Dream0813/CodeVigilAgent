@@ -91,17 +91,23 @@ def progress_line(message: str) -> str:
 
 
 def ensure_utf8_stdio() -> None:
+    """Windows 上把控制台切到 UTF-8，编码不了就替换。
+
+    只能用 reconfigure，不能 `sys.stdout = io.TextIOWrapper(...)` ——
+    换对象会让调用方此前没 flush 的输出整段丢失（frame_doctor 就踩过这个坑）。
+    非 Windows 直接跳过：Linux/macOS 的终端本来就是 UTF-8。
+    """
     if sys.platform != 'win32':
         return
-    import io
     for name in ('stdout', 'stderr'):
         stream = getattr(sys, name, None)
-        if stream is None:
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure is None:
             continue
         try:
-            if isinstance(stream, io.TextIOWrapper) and (stream.encoding or '').lower() == 'utf-8':
-                continue
-            buf = stream.buffer
-            setattr(sys, name, io.TextIOWrapper(buf, encoding='utf-8', errors='replace', line_buffering=True))
+            if (stream.encoding or '').lower() != 'utf-8':
+                reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+            else:
+                reconfigure(errors='replace')
         except Exception:
             pass

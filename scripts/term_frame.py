@@ -337,6 +337,117 @@ def hr(total: int = 0) -> str:
     return '─' * (total - 2)
 
 
+# ---------------------------------------------------------------------------
+# 光标绝对定位（CUP）渲染 —— 唯一能绕开字体差异的方案
+#
+# 补空格对齐的前提是「一个汉字正好占 2 个西文格」。这取决于终端**字体**：
+#   宋体 / 新宋体 —— ASCII 半角、汉字全角，严格 1:2，所以 Windows 控制台能对齐
+#   Linux 默认（DejaVu Sans Mono 0.6em + Noto CJK 1em）—— 约 1.66 格，会歪
+#   macOS 默认（Menlo 0.6em + 苹方 1em）—— 同样约 1.66 格，会歪
+#
+# 宽度是字体画的，程序改不了，所以「算法再准也压不住」。CUP 换了个思路：
+# 每行先把光标移到第 1 列画左边框和内容，再移到第 total 列画右边框。
+# 右边框落在**指定列号**上，不再依赖「内容占了多宽」—— 任何字体都对得齐。
+#
+# 代价（也是它的适用条件）：
+#   1. 需要 ANSI / VT 支持。Windows 10+ 控制台、Windows Terminal、所有 Unix 终端都行
+#   2. 内容若超过可用宽度会盖住右边框，所以截断必须按最坏情况（每字符 2 格）算
+#   3. 输出被重定向到文件时是一堆控制符，所以只在 isatty 时启用
+# ---------------------------------------------------------------------------
+
+_CUP_TEMPLATE = '\x1b[{};{}H'
+_CUF_TEMPLATE = '\x1b[{}C'
+
+
+def cup(row: int, col: int) -> str:
+    """把光标移到第 row 行、第 col 列（都从 1 开始）。"""
+    return _CUP_TEMPLATE.format(max(1, int(row)), max(1, int(col)))
+
+
+def cuf(cols: int) -> str:
+    """光标向右移动 cols 列（不换行）。"""
+    return _CUF_TEMPLATE.format(max(0, int(cols)))
+
+
+def cup_supported() -> bool:
+    """绝对定位只在真终端里有意义；输出重定向或没有 ANSI 时老老实实补空格。"""
+    try:
+        if not (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
+            return False
+    except Exception:
+        return False
+    mode = (os.environ.get('REVIEWAGENT_RENDER') or '').strip().lower()
+    return mode != 'pad'
+
+
+def safety_truncate(text: str, width: int) -> str:
+    """按「每个字符最多占 2 格」截断。
+
+    这是定位渲染的关键：不猜字体，直接按最坏情况留余量，
+    保证内容无论被画成多宽都不会盖到右边框那一列。
+    """
+    if width <= 0:
+        return ''
+    used = 0
+    out: List[str] = []
+    for ch in text:
+        w = 2 if ord(ch) > 0x7F else 1
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return ''.join(out)
+
+
+def box_rows(top: str, bodies: List[str], bottom: str,
+             total: int = 0) -> List[str]:
+    """生成「右边框按列定位」的盒子行。
+
+    三段都用同一招：画到差不多，然后 `\\r` 回行首、右移 (total-1) 列，
+    再补上收尾字符。
+
+        上/下边框：`╭─ 标题 ──────` → 回车 → 右移 → 清行尾 → `╮`
+        正文行  ：`│ 内容`       → 回车 → 右移 → `│`
+
+    为什么边框也要这么做：
+        边框字符串是按「中文占 2 格」拼出来的，若字体把汉字画成 1.66 格，
+        含中文标题的上边框就会比正文短 2 格，`╮` 落不到正文的右边框上。
+        先多画几段 `─` 再清行尾，右端就精确落在第 total 列。
+
+    为什么用 `\\r` + 右移，而不是 `\\x1b[row;colH` 绝对定位：
+        绝对定位要知道当前行号，输出一旦让屏幕滚动，行号就错了。
+        「回到行首再右移固定列数」只关心列，和行号、滚动都无关。
+
+    返回的列表每项都带换行，可以逐项 write。
+    """
+    total = total or total_width()
+    inner = max(1, total - 3)          # 第 1 列 │、第 2 列空格、内容从第 3 列起
+    tail = total - 1                    # 收尾字符所在列
+    out: List[str] = []
+
+    # 上边框：多画 12 个 ─ 保证一定盖过目标列，再用 \x1b[K 把多余的清掉
+    if top:
+        out.append(top[:-1] + '─' * 12)
+        out.append('\r' + cuf(tail) + '\x1b[K' + top[-1] + '\n')
+
+    for body in bodies:
+        out.append('│ ' + safety_truncate(body, inner))
+        out.append('\r' + cuf(tail) + '│\n')
+
+    # 下边框同理
+    if bottom:
+        out.append(bottom[:-1] + '─' * 12)
+        out.append('\r' + cuf(tail) + '\x1b[K' + bottom[-1] + '\n')
+
+    return out
+
+
+def box_anchor(top: str, bodies: List[str], bottom: str,
+               total: int = 0) -> str:
+    """同 box_rows，但直接返回一整段字符串，方便一次 write 出去。"""
+    return ''.join(box_rows(top, bodies, bottom, total))
+
+
 def _self_test() -> None:  # pragma: no cover - 手动排查用
     """终端宽度自检：找不到问题在哪时跑 `python -m scripts.term_frame`。
 

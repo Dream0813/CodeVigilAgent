@@ -29,6 +29,48 @@ def _plain_mode() -> bool:
     return '--plain' in sys.argv
 
 
+def _anchor_mode() -> bool:
+    return '--anchor' in sys.argv
+
+
+def _anchor_demo() -> int:
+    """定位渲染演示：右边框按列固定，不依赖字体宽度。
+
+    普通模式靠「补空格把右边框推到第 N 列」，补多少取决于算出来的宽度；
+    字体把汉字画成 1.66 格而不是 2 格时，右边框就会往右跑。
+    这里改成每行画完内容后 `\\r` 回行首、右移固定列数再画 `│`，
+    边框落在指定列上，跟字体无关。
+    """
+    total = tf.total_width()
+    print('=' * 60)
+    print(' 定位渲染演示（--anchor）')
+    print('=' * 60)
+    print(f' 目标宽度 : {total} 列')
+    print(' 原理：每行画完内容后回车到行首，右移固定列数再画右边框')
+    print()
+
+    cases = [
+        ('短行', ['短']),
+        ('中英混排', ['这是一行中文与 English 混排的内容']),
+        ('含符号', ['日常对话 · 读取 review.py · 命中 733 条记录']),
+        ('超长行（会自动截断）',
+         ['这一行故意写得非常长，用来验证截断不会盖住右边框，'
+          '即使字体把汉字画得比预期更宽也一样安全']),
+    ]
+    for title, bodies in cases:
+        sys.stdout.write(tf.box_anchor(
+            tf.top_border(title, total), bodies,
+            tf.bottom_border('', total), total=total))
+        print()
+
+    print('=' * 60)
+    print(' 判读方法：上面每个盒子的右边框应当都在同一条竖线上。')
+    print(' 如果都在 —— 说明这个方案不受字体影响，换系统也不用改设置。')
+    print(' 如果出现乱码控制符 —— 说明终端不支持 ANSI，改用普通模式。')
+    print('=' * 60)
+    return 0
+
+
 def _capture(fn, *a, **kw) -> str:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -56,6 +98,8 @@ def main() -> int:
     # 先兜住编码：GBK 控制台里 ✅ ❌ 这类字符会让 Python 直接抛
     # UnicodeEncodeError 退出，连体检报告都看不到。
     console_safe.harden_console()
+    if _anchor_mode():
+        return _anchor_demo()
     total = tf.total_width()
     print('=' * 60)
     print(' ReviewAgent 边框体检')

@@ -380,23 +380,44 @@ def cup_supported() -> bool:
     return mode != 'pad'
 
 
+_ANSI_SEQ = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
 def safety_truncate(text: str, width: int) -> str:
     """按「每个字符最多占 2 格」截断。
 
     这是定位渲染的关键：不猜字体，直接按最坏情况留余量，
     保证内容无论被画成多宽都不会盖到右边框那一列。
+
+    颜色码（ANSI 转义）宽度记 0 且原样保留 —— 按普通字符截会把
+    `\\x1b[38;5;37m` 切成两半，终端就会吐出乱码。
+    如果截断时有未闭合的颜色，末尾补一个 RESET。
     """
     if width <= 0:
         return ''
     used = 0
     out: List[str] = []
-    for ch in text:
+    i = 0
+    n = len(text)
+    cut = False
+    while i < n:
+        m = _ANSI_SEQ.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch = text[i]
         w = 2 if ord(ch) > 0x7F else 1
         if used + w > width:
+            cut = True
             break
         out.append(ch)
         used += w
-    return ''.join(out)
+        i += 1
+    result = ''.join(out)
+    if cut and '\x1b[' in result:
+        result += '\x1b[0m'
+    return result
 
 
 def box_rows(top: str, bodies: List[str], bottom: str,
@@ -444,8 +465,88 @@ def box_rows(top: str, bodies: List[str], bottom: str,
 
 def box_anchor(top: str, bodies: List[str], bottom: str,
                total: int = 0) -> str:
-    """同 box_rows，但直接返回一整段字符串，方便一次 write 出去。"""
+    """同 box_rows，但直接返回一整段字符串，方便一次 write。"""
     return ''.join(box_rows(top, bodies, bottom, total))
+
+
+def anchor_line(body: str, total: int = 0, paint=None) -> str:
+    """生成「一行内容 + 定位右边框 + 换行」—— 供流式输出（思考面板）逐行用。"""
+    total = total or total_width()
+    inner = max(1, total - 3)
+    p = paint if paint else (lambda s: s)
+    return (p('│ ') + safety_truncate(body, inner - 1) + ' '
+            + p('\r' + cuf(total - 1) + '│') + '\n')
+
+
+def border_line(text: str, total: int = 0) -> str:
+    """生成「一条边框 + 结束换行」，右端用定位钉在第 total 列。
+
+    含中文标题时，边框字符串按「中文 2 格」拼出来，若字体只画 1.66 格
+    就会短一截；多画几段横线再清行尾，可以保证右端精确落位。
+    """
+    total = total or total_width()
+    inner = max(1, total - 3)
+    if not text:
+        return '─' * (total - 2) + '\n'
+    return (text[:-1] + '─' * 12
+            + '\r' + cuf(total - 1) + '\x1b[K' + text[-1] + '\n')
+
+
+DIVIDER = '\x00divider\x00'
+
+
+def emit_box(title: str = '', bodies: Optional[List[str]] = None, note: str = '',
+             total: int = 0, paint=None, stream=None) -> None:
+    """按当前终端能力画一个盒子并直接输出。
+
+    能定位就定位（右边框钉在固定列，换字体也不会歪）；
+    不能定位（输出被重定向、或设了 REVIEWAGENT_RENDER=pad）就退回补空格。
+
+    bodies 里放一个 `DIVIDER` 会在那个位置画一条 `├──┤` 分隔线。
+    """
+    total = total or total_width()
+    bodies = bodies or []
+    p = paint if paint else (lambda s: s)
+    out = stream if stream is not None else sys.stdout
+    top = top_border(title, total)
+    bottom = bottom_border(note, total)
+    inner = max(1, total - 3)
+    tail = total - 1
+
+    if not cup_supported():
+        out.write(p(top) + '\n')
+        avail = content_width(total)
+        for body in bodies:
+            if body == DIVIDER:
+                out.write(p('├' + '─' * (total - 2) + '┤') + '\n')
+                continue
+            out.write(p('│ ' + pad_display(frame_safe(body), avail) + ' │') + '\n')
+        out.write(p(bottom) + '\n')
+        try:
+            out.flush()
+        except Exception:
+            pass
+        return
+
+    chunks = [p(top[:-1] + '─' * 12),
+              p('\r' + cuf(tail) + '\x1b[K' + top[-1]) + '\n']
+    for body in bodies:
+        if body == DIVIDER:
+            # 分隔线：中间接一竖，右端是 ┤
+            chunks.append(p('├' + '─' * (total - 2 + 10)))
+            chunks.append(p('\r' + cuf(tail) + '\x1b[K┤') + '\n')
+            continue
+        # 内容自己带颜色，只给左右边框套 paint —— 整行包一层会把内容的
+        # RESET 提前吃掉，右边框就变色了。末尾留 1 空格保持右边距。
+        chunks.append(p('│ ') + safety_truncate(frame_safe(body), inner - 1) + ' ')
+        chunks.append(p('\r' + cuf(tail) + '│') + '\n')
+    chunks.append(p(bottom[:-1] + '─' * 12))
+    chunks.append(p('\r' + cuf(tail) + '\x1b[K' + bottom[-1]) + '\n')
+    out.write(''.join(chunks))
+    try:
+        out.flush()
+    except Exception:
+        pass
 
 
 def _self_test() -> None:  # pragma: no cover - 手动排查用

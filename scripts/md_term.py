@@ -146,14 +146,16 @@ def print_markdown_box(md: str, title: str = 'Agent') -> None:
     enable_windows_ansi()
     total = tf.total_width()
     lines = render_markdown(md, tf.content_width(total))
+    # 先把每行按显示宽度折好，再整块交给 emit_box：
+    # 它会在支持的终端上用「定位渲染」（右边框钉在固定列，换字体也不歪），
+    # 不支持时自动退回补空格。
+    bodies = []
+    for line in lines:
+        body = line if colors_enabled() else _strip_ansi(line)
+        bodies.extend(tf.wrap_display(body, tf.content_width(total)))
     print()
     try:
-        print(ok(tf.top_border(title, total)))
-        for line in lines:
-            body = line if colors_enabled() else _strip_ansi(line)
-            for wrapped in tf.row_lines(body, total, paint=ok):
-                print(wrapped)
-        print(ok(tf.bottom_border('', total)))
+        tf.emit_box(title, bodies, total=total, paint=ok)
     except UnicodeEncodeError:
         print(ok(f'+-- {title} ' + '-' * max(4, total - 8 - len(title)) + '+'))
         for line in lines:

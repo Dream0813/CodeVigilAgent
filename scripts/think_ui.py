@@ -1,6 +1,7 @@
 """Pretty thinking / progress steps for chat (Claude Code–ish)."""
 from __future__ import annotations
 
+import sys
 import time
 from typing import List, Optional, Sequence, Union
 
@@ -29,7 +30,13 @@ class ThinkPanel:
         self._started = time.time()
         self._total = tf.total_width()
         print()
-        print(brand(tf.top_border(title, self._total)))
+        # 能定位就把右边框钉在固定列，换字体也不会歪
+        if tf.cup_supported():
+            sys.stdout.write(brand(tf.border_line(
+                tf.top_border(title, self._total), self._total)))
+            sys.stdout.flush()
+        else:
+            print(brand(tf.top_border(title, self._total)))
 
     def step(self, message: Union[str, Sequence[str]]) -> None:
         enable_windows_ansi()
@@ -44,8 +51,14 @@ class ThinkPanel:
         n = len(self.steps)
         # alternating accent for rhythm
         diamond = accent('◆') if n % 2 else brand('◇')
-        for line in tf.row_lines(c('97', text), self._total, paint=brand, indent=diamond + ' '):
-            print(line)
+        if tf.cup_supported():
+            sys.stdout.write(tf.anchor_line(diamond + ' ' + c('97', text),
+                                            self._total, paint=brand))
+            sys.stdout.flush()
+        else:
+            for line in tf.row_lines(c('97', text), self._total,
+                                     paint=brand, indent=diamond + ' '):
+                print(line)
 
     def close(self, ok_msg: str = '完成') -> None:
         if not self._open:
@@ -53,9 +66,15 @@ class ThinkPanel:
         elapsed = time.time() - self._started
         # ✓ 不在 GBK 里，按当前编码退回等宽的 v，避免 GBK 控制台抛编码错误
         body = ok(console_safe.glyph('✓', 'v') + ' ') + mute(f'{ok_msg} · {elapsed:.1f}s')
-        for line in tf.row_lines(body, self._total, paint=brand):
-            print(line)
-        print(brand(tf.bottom_border('', self._total)))
+        if tf.cup_supported():
+            sys.stdout.write(tf.anchor_line(body, self._total, paint=brand))
+            sys.stdout.write(brand(tf.border_line(
+                tf.bottom_border('', self._total), self._total)))
+            sys.stdout.flush()
+        else:
+            for line in tf.row_lines(body, self._total, paint=brand):
+                print(line)
+            print(brand(tf.bottom_border('', self._total)))
         self._open = False
 
 

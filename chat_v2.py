@@ -213,44 +213,35 @@ class UI:
 
         width=0 表示跟随 term_frame.total_width()，与输入框、思考面板
         用同一个宽度 —— 这样同一屏里所有竖线才落在同一列。
+
+        走 tf.emit_box：终端支持定位时把右边框钉在固定列，换字体也不会歪；
+        不支持时自动退回补空格。
         """
+        import io as _io
+
         total = width or tf.total_width()
-        inner = total - 2
-        lines = []
+        bodies = []
         border = lambda s: colored(s, Style.BRAND)
 
-        # 顶部圆角
-        lines.append(border(tf.top_border('', total)))
-
-        # 标题居中 + 细分隔线
+        # 标题居中 + 分隔线
         if title:
             safe = tf.frame_safe(title)
             # 调用方已上色就不再包一层，避免嵌套 RESET 把颜色吃掉
             rendered = safe if '\033[' in safe else bold(colored(safe, Style.BRAND))
             tw = tf.display_width(rendered)
-            left = max((inner - tw) // 2, 0)
-            right = max(inner - left - tw, 0)
-            lines.append(
-                border('│')
-                + ' ' * left + rendered + ' ' * right
-                + border('│')
-            )
-            lines.append(border('├' + '─' * inner + '┤'))
+            left = max((total - 4 - tw) // 2, 0)
+            bodies.append(' ' * left + rendered)
+            bodies.append(tf.DIVIDER)
 
         # 内容
         if content:
             for line in content.split('\n'):
-                for w in tf.wrap_display(line, tf.content_width(total)):
-                    lines.append(
-                        border('│')
-                        + ' ' + tf.pad_display(tf.frame_safe(w), tf.content_width(total)) + ' '
-                        + border('│')
-                    )
+                for wrapped in tf.wrap_display(line, tf.content_width(total)):
+                    bodies.append(wrapped)
 
-        # 底部圆角
-        lines.append(border(tf.bottom_border('', total)))
-
-        return '\n'.join(lines)
+        buf = _io.StringIO()
+        tf.emit_box('', bodies, total=total, paint=border, stream=buf)
+        return buf.getvalue().rstrip('\n')
 
     @staticmethod
     def section(title: str, width: int = 0):

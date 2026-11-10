@@ -239,3 +239,71 @@ class TestSafetyTruncate(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRealRenderers(unittest.TestCase):
+    """验证实际界面三处渲染点接入后的效果。
+
+    测试环境没有真终端，所以把 cup_supported 打成 True 来模拟
+    「终端支持定位」，再用 1.66 格字体的虚拟屏幕解析输出。
+    """
+
+    def _capture(self, fn):
+        import io
+        from unittest.mock import patch
+        buf = io.StringIO()
+        with patch('scripts.term_frame.cup_supported', return_value=True), \
+                patch('sys.stdout', buf):
+            fn()
+        return buf.getvalue()
+
+    def _assert_aligned(self, payload, label):
+        for han in (1.0, 1.66, 2.0):
+            screen = FakeScreen(han)
+            screen.feed(payload)
+            rights = {col for (row, col), ch in screen.cells.items()
+                      if ch in '╮╯│'}
+            rights.discard(1)
+            self.assertTrue(rights, f'{label}：没找到右边框')
+            self.assertEqual(len(rights), 1,
+                             f'{label}：汉字 {han} 格时右边框散落在 {sorted(rights)}')
+
+    def test_input_frame(self):
+        from unittest.mock import patch
+        from scripts.chat_input import print_input_frame
+        # StringIO 没有 encoding 属性，_can_box() 会判定「终端不支持制表符」
+        # 而回退成 ASCII 边框；这里显式打开制表符分支。
+        with patch('scripts.chat_input._can_box', return_value=True):
+            payload = self._capture(lambda: print_input_frame(
+                network='auto', chat_mode='auto', session_lane='chat'))
+        self.assertIn('\r', payload, '没有用定位渲染')
+        self._assert_aligned(payload, '输入提示框')
+
+    def test_think_panel(self):
+        from scripts.think_ui import ThinkPanel
+        panel = ThinkPanel()
+
+        def run():
+            panel.start('思考中')
+            panel.step('读取 review.py')
+            panel.step('中英混排 mixed 内容')
+            panel.close('回答就绪')
+        payload = self._capture(run)
+        self.assertIn('\r', payload)
+        self._assert_aligned(payload, '思考面板')
+
+    def test_markdown_box(self):
+        from scripts.md_term import print_markdown_box
+        payload = self._capture(lambda: print_markdown_box(
+            '这是正文内容。\n\n- 列表项一\n- 列表项二', title='Agent'))
+        self.assertIn('\r', payload)
+        self._assert_aligned(payload, 'Agent 回复框')
+
+    def test_welcome_box(self):
+        from unittest.mock import patch
+        from chat_v2 import UI
+        with patch('scripts.term_frame.cup_supported', return_value=True):
+            payload = UI.box('能做什么', '* 粘贴代码 -> 直接审查\n* 发 GitHub 链接 -> 分析 PR')
+        self.assertIn('\r', payload, '欢迎卡没有用定位渲染')
+        self.assertIn('├', payload, '分隔线丢了')
+        self._assert_aligned(payload, '欢迎卡')

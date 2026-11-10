@@ -58,10 +58,9 @@ def print_input_frame(network='auto', chat_mode='auto', session_lane='chat'):
         print(brand('| ') + mute(tf.pad_display(hint_txt, total - 4)) + brand(' |'))
         print(brand('+' + '-' * (total - 2) + '+'))
         return
-    print(brand(tf.top_border(title_txt, total)))
-    for line in tf.row_lines(mute(hint_txt), total, paint=brand):
-        print(line)
-    print(brand(tf.bottom_border('', total)))
+    # 走统一入口：终端支持 ANSI 时用「定位渲染」，右边框钉在固定列，
+    # 换字体（Linux/macOS 默认字体把汉字画成 1.66 格）也不会歪。
+    tf.emit_box(title_txt, [mute(hint_txt)], total=total, paint=brand)
 
 
 def _smart_input_wanted() -> bool:

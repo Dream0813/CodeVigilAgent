@@ -85,3 +85,7 @@ reviewagent-fresh.old.*/
 
 # macOS desktop build output
 desktop-app/build/
+
+# Windows 桌面版：记住上次选的仓库路径，属于本机状态
+desktop-app/win/last_repo.txt
+desktop-app/win/__pycache__/

@@ -112,17 +112,36 @@ node tests/test_wizard_confirm.js
 
 ## 七、跑起来
 
-Windows：
+### Windows 桌面版（双击即用）
+
+双击根目录的 **`启动桌面版.bat`**。
+
+打开一个原生窗口：选仓库目录 → 点「审查当前改动」，或在底部输入框直接提问。
+输出带颜色、可滚动；`模型设置` 里填服务商 / 模型 / base_url / API Key。
+
+几个实现上的决定：
+
+| 决定 | 原因 |
+|---|---|
+| 用 tkinter（Python 标准库） | 不下载任何依赖。注意 PATH 里可能有精简版 Python 不带 tkinter，启动器会自动挑一个能用的 |
+| 输出区字体用**新宋体** | 它是「ASCII 半角 + 汉字全角」，宽度严格 1:2，CLI 那套补空格对齐才成立。换 Consolas 中文走回退字体，比例不是 2，框线会歪 |
+| 子进程强制 `REVIEWAGENT_RENDER=pad` | 文本框里没有终端光标，「定位渲染」的控制序列只会显示成乱码 |
+| 启动即最大化 | 4K / 高 DPI 屏上窗口高度会被系统压到逻辑 700 以内，底部输入行会被裁掉 |
+
+### Windows 终端版
 
 ```cmd
 cd CodeVigilAgent
 node bin\reviewagent.js
 ```
 
-或双击 `start-reviewagent.bat`。首次使用需要在「模型设置」里填 API 配置
-（默认读 `~/.reviewagent/ai_config.json`）。
+或双击 `start-reviewagent.bat`。
 
-macOS：`chmod +x desktop-app/build-mac.sh && ./desktop-app/build-mac.sh`
+### macOS
+
+```bash
+chmod +x desktop-app/build-mac.sh && ./desktop-app/build-mac.sh
+```
 
 ## 八、已知限制
 

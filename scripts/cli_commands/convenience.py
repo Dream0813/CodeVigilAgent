@@ -39,7 +39,7 @@ def open_directory(ctx: SlashContext, arg: str) -> None:
     }
     path = targets.get(target)
     if path is None:
-        print(warn('用法: /open repo|config|sessions|backups'))
+        print(warn('用法: /dir repo|config|sessions|backups'))
         return
     opened, detail = open_path(path)
     print(ok(detail) if opened else warn(detail))

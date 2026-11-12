@@ -61,15 +61,18 @@
 | `scripts/usage_meter.py` | `/cost` 用量估算 | 一般不动 |
 | `scripts/cli_commands/` | 斜杠命令注册表：新命令加文件，不改入口 | 加内置命令时 |
 | `scripts/system_open.py` `clipboard.py` `config_backup.py` | 打开目录 / 剪贴板 / 配置备份 | 一般不动 |
+| `scripts/model_catalog.py` | 厂商与模型清单的唯一出处（CLI `model --list` 的 CATALOG） | 加模型时只改这里 |
+| `scripts/model_choices.py` | 下拉选项的纯逻辑（选厂商 / 选模型 / 自定义降级），CLI 与桌面共用 | 一般不动 |
 | `tests/test_structure_guard.py` | 结构守卫：行数预算、分层、注册表约定 | 调预算时 |
 | `desktop-app/win/app.py` | 桌面版入口，20 行 | 不动 |
 | `desktop-app/win/cvapp/shell.py` | 窗口骨架：侧边栏 + 工作区 | 一般不动 |
 | `desktop-app/win/cvapp/features/` | **桌面版功能注册表** | 加桌面功能只动这里 |
 | `desktop-app/win/cvapp/theme.py` | 颜色 / 字体 / 尺寸唯一来源 | 改配色时 |
+| `desktop-app/CodeVigilAgentApp.swift` | macOS 版（SwiftUI），模型下拉复用 CLI `model --list --json` | 改 Mac 界面时 |
 | `bin/` | Node 层 CLI（`reviewagent` 命令） | 加 npm 子命令时会 |
 | `launchers/` | 次要启动脚本 | 不动 |
 | `legacy/` | 已退役入口，只留档 | 不动 |
-| `tests/` | 回归测试（286 项 Python + 9 项 JS） | 每次加功能都要加 |
+| `tests/` | 回归测试（394 项 Python + 9 项 JS） | 每次加功能都要加 |
 
 ---
 

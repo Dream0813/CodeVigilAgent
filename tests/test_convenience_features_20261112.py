@@ -174,6 +174,9 @@ class SlashConvenienceTests(unittest.TestCase):
     def test_dir_unknown_target_shows_usage(self):
         _, out = self._run('/dir 什么')
         self.assertIn('用法', out)
+        # 提示里的命令名必须是 /dir；写成 /open 会指到内置「打开历史会话」
+        self.assertIn('/dir', out)
+        self.assertNotIn('/open', out)
 
     def test_typo_suggests_closest_command(self):
         _, out = self._run('/revew')

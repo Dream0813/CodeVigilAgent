@@ -110,11 +110,22 @@ class ChatV2BoxTests(unittest.TestCase):
         self.assertEqual(tf.display_width(line), tf.total_width())
 
     def test_no_private_width_implementation_left(self):
-        """chat_v2 不能再自己数宽度。"""
-        src = (ROOT / 'chat_v2.py').read_text(encoding='utf-8')
-        self.assertNotIn('east_asian_width', src,
-                         'chat_v2 里还有自己的宽度实现，应统一走 term_frame')
-        self.assertIn('tf.display_width', src)
+        """宽度只能有一处实现。
+
+        UI 组件已从 chat_v2.py 抽到 scripts/term_ui.py（表现层），
+        所以检查两处：都不能自己实现宽度；term_ui 必须走 term_frame。
+        """
+        chat_src = (ROOT / 'chat_v2.py').read_text(encoding='utf-8')
+        ui_src = (ROOT / 'scripts' / 'term_ui.py').read_text(encoding='utf-8')
+
+        for name, src in (('chat_v2.py', chat_src), ('scripts/term_ui.py', ui_src)):
+            self.assertNotIn('east_asian_width', src,
+                             f'{name} 里还有自己的宽度实现，应统一走 term_frame')
+
+        self.assertIn('tf.display_width', ui_src,
+                      'term_ui.py 应通过 term_frame.display_width 计算宽度')
+        self.assertIn('term_ui', chat_src,
+                      'chat_v2 应从 term_ui 取 UI 组件，而不是另起一套')
 
 
 class NodeParityTests(unittest.TestCase):

@@ -29,6 +29,26 @@ GitCode 在线上下文、技能安装和社区采集只读取 `GITCODE_TOKEN`�
 
 ---
 
+## 🗂 项目地图
+
+根目录只保留「入口 + 核心目录」，其余按用途归档（详细分层见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)）：
+
+| 路径 | 放什么 |
+|------|--------|
+| `ascend_cli.py` | 主入口：`review` / `chat` / `doctor` / `config` / `sessions` / `model` |
+| `chat_v2.py` `review.py` | 终端对话界面 / npm 包兼容入口 |
+| `review_cli.py` | 旧版 CLI，文档仍在引用，保留兼容 |
+| `bin/` `scripts/` | Node CLI 层 / Python 业务层（审查、知识库、MCP、终端渲染） |
+| `desktop-app/win/` | Windows 桌面版：`app.py` 入口 + `cvapp/` 分层实现（功能注册表） |
+| `tests/` | 回归测试（286 项 Python + 9 项 JS） |
+| `docs/` | 设计、使用与架构文档 |
+| `launchers/` | 次要启动脚本（兼容模式 / 边框体检 / 新用户模式） |
+| `legacy/` | 已退役入口，仅留档，日常不用 |
+| `启动桌面版.bat` | 双击打开 Windows 桌面版 |
+| `start-reviewagent.bat` | 双击打开终端版 |
+
+---
+
 ## 🚀 30 秒快速开始（Hermes 风格）
 
 ```bash
@@ -314,9 +334,11 @@ python review_cli.py config --set model=claude-3-opus-20240229
 ## 📚 文档
 
 - [CLI 使用指南](docs/CLI_GUIDE.md) - 命令行详细教程
+- [架构说明](docs/ARCHITECTURE.md) - 分层、依赖方向、扩展点
+- [新增功能指南](docs/ADDING-FEATURES.md) - 三步加一个功能
 - [AI 架构文档](docs/AI_ARCHITECTURE.md) - 技术架构
-- [完整总结](FINAL_SUMMARY.md) - 项目全貌
-- [手动执行指南](MANUAL_EXECUTION_GUIDE.md) - 故障排除
+- [完整总结](docs/FINAL_SUMMARY.md) - 项目全貌
+- [手动执行指南](docs/MANUAL_EXECUTION_GUIDE.md) - 故障排除
 
 ---
 

@@ -183,7 +183,9 @@ ReviewAgent/
 │   └── README.md
 ├── README.md                       # 项目主文档
 ├── CHANGELOG.md                    # 版本记录
-├── PROJECT_STRUCTURE.md           # 结构说明
+├── docs/                           # 设计与结构文档
+│   ├── ARCHITECTURE.md             # 分层说明
+│   └── PROJECT_STRUCTURE.md        # 结构清单
 └── SUMMARY.md                     # 本文件
 ```
 

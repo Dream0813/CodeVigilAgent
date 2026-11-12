@@ -108,6 +108,7 @@ launchers\ascend.bat review
 ```
 
 只允许仓库内路径，单文件上限 64 KB，一次最多 8 个，二进制自动跳过。
+相对路径按**当前选中的仓库**解析（桌面版选哪个仓库就在哪个仓库里找）。
 
 **3. 提交前门禁** —— 装一个钩子，`git commit` 前自动跑离线审查（不需要 API Key）：
 
@@ -126,6 +127,47 @@ python ascend_cli.py review --staged --offline --fail-on high   # 手动跑
 ```
 
 按中英文分别估算，不报金额（各网关单价差异太大）。
+
+### 顺手的小功能（与审查逻辑无关）
+
+**打开常用目录**（省得自己找 `~/.reviewagent` 在哪）：
+
+```bash
+ascend_cli.py open config      # 配置目录
+ascend_cli.py open sessions    # 会话记录
+ascend_cli.py open backups     # 配置备份
+ascend_cli.py open repo        # 当前目录
+ascend_cli.py open "D:/任意/路径"
+```
+
+Windows 交给默认程序，macOS 用 `open`，Linux 用 `xdg-open`；找不到会明确提示，不静默失败。
+对话里等价命令：`/dir repo|config|sessions|backups`（`/open` 是内置的「打开历史会话」，两者不冲突）。
+
+**配置备份 / 回滚**（改错 key 也能退回去）：
+
+```bash
+ascend_cli.py config --backup        # 手动备份一份
+ascend_cli.py config --backups       # 看看有哪些
+ascend_cli.py config --restore       # 恢复最近一份
+ascend_cli.py config --restore 1901  # 按名字片段恢复
+```
+
+`config --set` 在写入前会**自动备份**，默认保留最近 20 份，恢复前还会再存一份“恢复前状态”。
+
+**复制上一条回答**：
+
+```text
+/copy
+```
+
+Windows 直接调系统剪贴板（ctypes，无第三方库），macOS 用 `pbcopy`，
+Linux 依次尝试 `wl-copy` / `xclip` / `xsel`；都没有时提示手动复制。
+
+**命令拼错会猜你想输什么**：
+
+```text
+/revew  →  你是不是想输入 /review ？
+```
 
 ### 本地昇腾案例检索
 

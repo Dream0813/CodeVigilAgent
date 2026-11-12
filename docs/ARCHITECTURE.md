@@ -59,6 +59,9 @@
 | `scripts/file_mentions.py` | `@文件` 引用解析与安全边界 | 一般不动 |
 | `scripts/git_hooks.py` | pre-commit 钩子安装/卸载 | 一般不动 |
 | `scripts/usage_meter.py` | `/cost` 用量估算 | 一般不动 |
+| `scripts/cli_commands/` | 斜杠命令注册表：新命令加文件，不改入口 | 加内置命令时 |
+| `scripts/system_open.py` `clipboard.py` `config_backup.py` | 打开目录 / 剪贴板 / 配置备份 | 一般不动 |
+| `tests/test_structure_guard.py` | 结构守卫：行数预算、分层、注册表约定 | 调预算时 |
 | `desktop-app/win/app.py` | 桌面版入口，20 行 | 不动 |
 | `desktop-app/win/cvapp/shell.py` | 窗口骨架：侧边栏 + 工作区 | 一般不动 |
 | `desktop-app/win/cvapp/features/` | **桌面版功能注册表** | 加桌面功能只动这里 |
@@ -121,8 +124,23 @@ FEATURES = [
 | `.reviewagent/commands/*.md` | 自定义斜杠命令（`/并发`、`/报错`…） | 放一个 Markdown，`/commands` 立即可见；正文可用 `$ARGUMENTS` |
 | 消息里的 `@路径` | 把仓库文件内容带进对话 | 直接写 `@src/a.py`；只允许仓库内、单文件 ≤64 KB、每次 ≤8 个 |
 | `install-hook` | 提交前自动离线审查 | `python ascend_cli.py install-hook --severity high`；`--fail-on` 控制退出码 |
+| `scripts/cli_commands/*.py` | 内置斜杠命令（`/copy`、`/dir`…） | 新建文件写 `COMMANDS = {'/名字': 函数}`，自动发现；**不要改 `handle_chat_slash()`** |
 
 会话用量用 `/cost` 查看（字符级估算，不报金额）。
+
+### 结构守卫（让「拥挤」在测试里失败）
+
+`tests/test_structure_guard.py` 把评审的担心变成可执行规则：
+
+| 规则 | 作用 |
+|------|------|
+| 关键文件行数预算 | `ascend_cli.py` 等超预算就红，必须拆模块或显式调预算 |
+| `handle_chat_slash` 函数预算 | 禁止继续往同一个函数堆命令，新命令走注册表 |
+| 分层方向 | `scripts/` 不许 import `ascend_cli`，桌面层不许依赖 CLI 入口 |
+| 注册表约定 | `cli_commands/` 下每个模块必须声明 `COMMANDS` |
+| 根目录文件数 ≤20 | 防止文件重新堆回根目录 |
+
+超预算时的正确做法：先拆模块；确实要加，再改预算数字，并在提交信息里写理由。
 
 ---
 

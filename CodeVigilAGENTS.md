@@ -28,6 +28,20 @@
 
 镜像目录：`.cursor/`（Cursor）与 `.agents/`（通用）；Codex 见 `.codex/agents/*.toml`。
 
+## 开发规则（加功能前必读）
+
+评审明确反馈过：「整体结构上有点拥挤，如果后面加新的功能会影响」。
+以下规则由 `tests/test_structure_guard.py` 自动检查，不是建议：
+
+1. **先定层再写码**：入口 / 编排 / 能力 / 基础，只允许上层依赖下层
+2. **新斜杠命令**放 `scripts/cli_commands/`，声明 `COMMANDS = {'/名字': 函数}`；
+   **不要**再往 `handle_chat_slash()` 里加 if（该函数有行数预算）
+3. **新桌面功能**放 `desktop-app/win/cvapp/features/`，不改 shell 布局
+4. **单文件有行数预算**（见结构守卫）。超了先拆模块；确要加，改预算并在提交信息写理由
+5. **`scripts/` 不许 import `ascend_cli`**，桌面层不许依赖 CLI 入口（分层不能反向）
+6. **加功能必须加测试**，并跑 `python -m unittest discover -s tests`
+7. **结构决策写进 `docs/ARCHITECTURE.md`**，不要只留在对话记录里
+
 ## CLI（本地）
 
 ```bash

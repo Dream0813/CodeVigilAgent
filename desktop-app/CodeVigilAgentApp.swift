@@ -109,6 +109,320 @@ private final class ReaderCompletion {
     }
 }
 
+// MARK: - 模型清单（唯一来源：Python 侧 scripts/model_catalog.py 的 CATALOG）
+//
+// 桌面端不维护第二份模型列表，也不在这里写死厂家/模型名：
+// 打开「模型设置」时调用
+//     python ascend_cli.py model --list --json
+// 把返回的 JSON 解析成两个下拉框的选项。
+// Swift 里只保留 ModelSettingsForm 里那一个极小的兜底字符串，见下方注释。
+
+private struct ModelCatalogEntry {
+    let label: String
+    let fileProvider: String
+    let baseURL: String
+    let models: [String]
+    let defaultModel: String
+    let aliases: [String]
+    let isCurrent: Bool
+
+    init?(_ raw: [String: Any]) {
+        guard let label = raw["label"] as? String, !label.isEmpty,
+              let fileProvider = raw["file_provider"] as? String,
+              let models = raw["models"] as? [String], !models.isEmpty else { return nil }
+        self.label = label
+        self.fileProvider = fileProvider
+        self.baseURL = raw["base_url"] as? String ?? ""
+        self.models = models
+        let fallbackDefault = raw["default_model"] as? String ?? ""
+        self.defaultModel = models.contains(fallbackDefault) ? fallbackDefault : models[0]
+        self.aliases = raw["aliases"] as? [String] ?? []
+        self.isCurrent = raw["current"] as? Bool ?? false
+    }
+
+    /// 下拉框标题：厂商名 + 一个别名，别名同样来自 catalog（例如 glm（智谱））。
+    /// 优先中文别名，中文用户更好认；与 Python 侧 scripts/model_choices.py 的规则一致。
+    var displayTitle: String {
+        let others = aliases.filter { $0.lowercased() != label.lowercased() }
+        guard !others.isEmpty else { return label }
+        let alias = others.first { $0.unicodeScalars.contains { $0.value > 127 } } ?? others[0]
+        return "\(label)（\(alias)）"
+    }
+
+    /// 配置文件里存的 provider 可能是 label / file_provider / alias，都要能对上。
+    func matches(provider: String) -> Bool {
+        let name = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if name.isEmpty { return false }
+        return name == label.lowercased()
+            || name == fileProvider.lowercased()
+            || aliases.contains { $0.lowercased() == name }
+    }
+}
+
+private struct ModelCatalog {
+    let entries: [ModelCatalogEntry]
+    let activeProvider: String
+    let activeModel: String
+    let activeBaseURL: String
+
+    static func parse(_ data: Data) -> ModelCatalog? {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rawEntries = root["catalog"] as? [[String: Any]] else { return nil }
+        let entries = rawEntries.compactMap(ModelCatalogEntry.init)
+        guard !entries.isEmpty else { return nil }
+        let active = root["active"] as? [String: Any] ?? [:]
+        return ModelCatalog(entries: entries,
+                            activeProvider: active["provider"] as? String ?? "",
+                            activeModel: active["model"] as? String ?? "",
+                            activeBaseURL: active["base_url"] as? String ?? "")
+    }
+}
+
+private struct ModelCatalogLoad {
+    let catalog: ModelCatalog?
+    let error: String
+}
+
+private enum ModelCatalogLoader {
+    /// 调用 CLI 取清单。失败时返回 (nil, 原因)，调用方负责降级成手动输入。
+    static func load(pythonPath: String?, backend: URL,
+                     environment: [String: String]) -> ModelCatalogLoad {
+        guard let pythonPath = pythonPath else {
+            return ModelCatalogLoad(catalog: nil, error: "找不到 Python 3")
+        }
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: pythonPath)
+        process.currentDirectoryURL = backend
+        process.arguments = [backend.appendingPathComponent("ascend_cli.py").path,
+                             "model", "--list", "--json"]
+        process.standardOutput = stdout
+        process.standardError = stderr
+        process.environment = environment
+        do {
+            try process.run()
+        } catch {
+            return ModelCatalogLoad(catalog: nil, error: error.localizedDescription)
+        }
+        // 清单只有几 KB，先读完管道再等退出，不会把子进程的缓冲区塞满
+        let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let detail = (String(data: errorData, encoding: .utf8) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let reason = detail.isEmpty ? "退出码 \(process.terminationStatus)"
+                                        : "退出码 \(process.terminationStatus)：\(detail)"
+            return ModelCatalogLoad(catalog: nil, error: reason)
+        }
+        guard let catalog = ModelCatalog.parse(outputData) else {
+            return ModelCatalogLoad(catalog: nil, error: "返回内容不是合法的 JSON 清单")
+        }
+        return ModelCatalogLoad(catalog: catalog, error: "")
+    }
+}
+
+// MARK: - 模型设置表单
+//
+// 两个下拉框（厂商 / 模型），选项全部来自上面的 catalog；
+// 「自定义模型」用于私有部署等清单里没有的模型名。
+// 读不到清单时降级成「模型 ID」文本框，并保留原有配置不动。
+
+private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
+    static let customModelTitle = "自定义模型…"
+
+    private(set) var grid = NSGridView(views: [[NSView()]])
+    let keyField = NSSecureTextField(string: "")
+
+    private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let customModelField = NSTextField(string: "")
+    private let baseURLField = NSTextField(string: "")
+    private let hintLabel = NSTextField(wrappingLabelWithString: "")
+
+    private var displayedEntries: [ModelCatalogEntry?] = []
+    private var displayedModels: [String] = []
+
+    private let existingProvider: String
+    private let existingModel: String
+
+    init(existing: [String: Any], load: ModelCatalogLoad) {
+        existingProvider = (existing["provider"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        existingModel = (existing["model"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        super.init()
+        buildViews(existing: existing, load: load)
+    }
+
+    private func buildViews(existing: [String: Any], load: ModelCatalogLoad) {
+        let existingBase = (existing["base_url"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        baseURLField.stringValue = existingBase
+        baseURLField.placeholderString = "默认地址（可留空）"
+        keyField.placeholderString = "留空以保留现有密钥"
+        customModelField.placeholderString = "清单里没有的模型名（私有部署用）"
+        // 自定义模型框始终可编辑；打字时会自动把模型下拉切到「自定义模型…」
+        customModelField.delegate = self
+
+        let providerLabel = NSTextField(labelWithString: "服务商")
+        let modelLabel = NSTextField(labelWithString: "模型")
+        let customLabel = NSTextField(labelWithString: "自定义模型")
+        let baseLabel = NSTextField(labelWithString: "API 地址")
+        let keyLabel = NSTextField(labelWithString: "API Key")
+
+        var views: [[NSView]] = []
+        if let catalog = load.catalog {
+            views = [
+                [providerLabel, providerPopup],
+                [modelLabel, modelPopup],
+                [customLabel, customModelField],
+                [baseLabel, baseURLField],
+                [keyLabel, keyField],
+            ]
+            // 优先用 CLI 算好的 current：kimi / gemini / qwen 等的 file_provider 都是 openai，
+            // 只按 provider 匹配会把它们错认成 openai，必须靠 base_url 区分
+            let preferred = catalog.entries.first(where: { $0.isCurrent })
+                ?? catalog.entries.first(where: { $0.matches(provider: existingProvider) })
+                ?? catalog.entries[0]
+            for (index, entry) in catalog.entries.enumerated() {
+                providerPopup.addItem(withTitle: entry.displayTitle)
+                displayedEntries.append(entry)
+                if entry.label == preferred.label { providerPopup.selectItem(at: index) }
+            }
+            let known = catalog.entries.contains(where: { $0.isCurrent || $0.matches(provider: existingProvider) })
+            if !existingProvider.isEmpty, !known {
+                // 配置里的厂商不在清单中：保留原值，避免只打开对话框就把它改掉
+                providerPopup.insertItem(withTitle: "保持原值（\(existingProvider)）", at: 0)
+                displayedEntries.insert(nil, at: 0)
+                providerPopup.selectItem(at: 0)
+            }
+            populateModels(for: selectedEntry(), preferred: existingModel)
+            hintLabel.stringValue = "模型清单来自终端 CLI（\(catalog.entries.count) 个厂商）。"
+            hintLabel.textColor = .secondaryLabelColor
+        } else {
+            // 读不到清单 → 手动输入模式，原有配置原样保留
+            modelLabel.stringValue = "模型 ID"
+            views = [
+                [modelLabel, customModelField],
+                [baseLabel, baseURLField],
+                [keyLabel, keyField],
+            ]
+            customModelField.stringValue = existingModel
+            hintLabel.stringValue = "无法读取模型清单（\(load.error)），已改为手动输入；保存不会改动其它配置。"
+            hintLabel.textColor = .systemRed
+        }
+
+        views.append([NSTextField(labelWithString: ""), hintLabel])
+        grid = NSGridView(views: views)
+        grid.columnSpacing = 12
+        grid.rowSpacing = 10
+        // 最后一行是提示，可能换行成两行，单独给 44pt，避免错误信息被裁掉
+        let hintRow = views.count - 1
+        grid.row(at: hintRow).height = 44
+        hintLabel.maximumNumberOfLines = 2
+        hintLabel.preferredMaxLayoutWidth = 300
+        grid.frame = NSRect(x: 0, y: 0, width: 440,
+                            height: CGFloat(hintRow) * 24 + CGFloat(hintRow) * 10 + 44)
+        for control in [providerPopup, modelPopup, customModelField, baseURLField, keyField, hintLabel] as [NSView] {
+            control.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        }
+        providerPopup.target = self
+        providerPopup.action = #selector(providerChanged(_:))
+        modelPopup.target = self
+        modelPopup.action = #selector(modelChanged(_:))
+    }
+
+    /// 保存校验失败时把原因写进对话框，而不是让对话框直接关掉、用户白填一遍
+    func showHint(_ text: String) {
+        hintLabel.stringValue = text
+        hintLabel.textColor = .systemRed
+    }
+
+    private func selectedEntry() -> ModelCatalogEntry? {
+        let index = providerPopup.indexOfSelectedItem
+        guard displayedEntries.indices.contains(index) else { return nil }
+        return displayedEntries[index]
+    }
+
+    private func populateModels(for entry: ModelCatalogEntry?, preferred: String) {
+        displayedModels = entry?.models ?? []
+        modelPopup.removeAllItems()
+        if !displayedModels.isEmpty {
+            modelPopup.addItems(withTitles: displayedModels)
+        }
+        modelPopup.addItem(withTitle: ModelSettingsForm.customModelTitle)
+        // 自定义框一直可编辑，所以这里只改文字，不碰 isEnabled
+        customModelField.stringValue = ""
+
+        let wanted = preferred.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !wanted.isEmpty {
+            if let index = displayedModels.firstIndex(of: wanted) {
+                modelPopup.selectItem(at: index)
+            } else {
+                // 当前模型不在清单里也要正确回显，不强行改成 default_model
+                modelPopup.selectItem(at: displayedModels.count)
+                customModelField.stringValue = wanted
+            }
+            return
+        }
+        guard let entry = entry else {
+            modelPopup.selectItem(at: displayedModels.count)
+            return
+        }
+        if let index = displayedModels.firstIndex(of: entry.defaultModel) {
+            modelPopup.selectItem(at: index)
+        }
+    }
+
+    @objc private func providerChanged(_ sender: NSPopUpButton) {
+        let entry = selectedEntry()
+        // 切厂商时自动带出该厂商的 base_url；用户之后仍可手动改
+        baseURLField.stringValue = entry?.baseURL ?? ""
+        populateModels(for: entry, preferred: entry == nil ? existingModel : "")
+    }
+
+    @objc private func modelChanged(_ sender: NSPopUpButton) {
+        let isCustom = sender.indexOfSelectedItem >= displayedModels.count
+        if !isCustom {
+            // 选回清单里的模型 → 清掉手填内容，避免残留值让人误会
+            customModelField.stringValue = ""
+        }
+    }
+
+    /// 在「自定义模型」里打字 → 模型下拉自动跳到「自定义模型…」。
+    /// 这样用户不用先在下拉里选一次，保存时也一定用的是他写的名字。
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === customModelField else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        if modelPopup.indexOfSelectedItem != displayedModels.count {
+            modelPopup.selectItem(at: displayedModels.count)
+        }
+    }
+
+    /// 读回用户的选择；模型为空时返回 nil（调用方提示错误并保留原配置）。
+    func selection() -> (provider: String, model: String, baseURL: String)? {
+        let modelIndex = modelPopup.indexOfSelectedItem
+        // 手填框有内容就以它为准（和 Windows 端 prefer_custom 规则一致）；
+        // 否则命中清单取下拉项，落在「自定义模型…」取文本框
+        var model = customModelField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.isEmpty, displayedModels.indices.contains(modelIndex) {
+            model = displayedModels[modelIndex]
+        }
+        guard !model.isEmpty else { return nil }
+        // 「保持原值」场景下 provider 沿用配置里的值；两者都空时用内置默认，避免写空字符串
+        let provider = selectedEntry()?.fileProvider
+            ?? (existingProvider.isEmpty ? "deepseek" : existingProvider)
+        return (provider,
+                model,
+                baseURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
 // MARK: - 输出区排版
 //
 // 输出区显示的是终端文本，里面有框线（╭ ─ │ ╯）、缩进和箭头，必须严格按
@@ -525,44 +839,36 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         let existing = (try? Data(contentsOf: configURL)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         } ?? [:]
-        let provider = NSPopUpButton()
-        provider.addItems(withTitles: ["deepseek", "openai", "claude", "glm"])
-        let existingProvider = existing["provider"] as? String ?? "deepseek"
-        if provider.item(withTitle: existingProvider) == nil { provider.addItem(withTitle: existingProvider) }
-        provider.selectItem(withTitle: existingProvider)
-        let model = NSTextField(string: existing["model"] as? String ?? "deepseek-chat")
-        let baseURL = NSTextField(string: existing["base_url"] as? String ?? "")
-        baseURL.placeholderString = "默认地址（可留空）"
-        let key = NSSecureTextField(string: "")
-        key.placeholderString = "留空以保留现有密钥"
-        let grid = NSGridView(views: [
-            [NSTextField(labelWithString: "服务商"), provider],
-            [NSTextField(labelWithString: "模型 ID"), model],
-            [NSTextField(labelWithString: "API 地址"), baseURL],
-            [NSTextField(labelWithString: "API Key"), key],
-        ])
-        grid.columnSpacing = 12
-        grid.rowSpacing = 10
-        grid.frame = NSRect(x: 0, y: 0, width: 420, height: 150)
-        [model, baseURL, key].forEach { $0.widthAnchor.constraint(equalToConstant: 300).isActive = true }
+        // 清单只从 CLI 取（scripts/model_catalog.py 的 CATALOG），失败则降级手动输入
+        let load = ModelCatalogLoader.load(pythonPath: pythonRuntimePath(),
+                                           backend: backendRoot(),
+                                           environment: backendEnvironment())
+        if !load.error.isEmpty {
+            appendOutput("\n无法读取模型清单：\(load.error)（已改为手动输入）\n", color: .systemOrange)
+        }
+        let form = ModelSettingsForm(existing: existing, load: load)
         let alert = NSAlert()
         alert.messageText = "模型设置"
         alert.informativeText = "API Key 保存在本机 \(configURL.path)。"
-        alert.accessoryView = grid
+        alert.accessoryView = form.grid
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard !model.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            appendOutput("\n模型 ID 不能为空。\n")
-            return
+        var selection: (provider: String, model: String, baseURL: String)?
+        while selection == nil {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            selection = form.selection()
+            if selection == nil {
+                // 不关窗口重来：用户填的 Key / base_url 还在，改一下模型就能存
+                form.showHint("模型不能为空：请在「模型」下拉里选一个，或选「自定义模型…」后填写名称。")
+            }
         }
+        guard let chosen = selection else { return }
         var config = existing
-        let selectedProvider = provider.titleOfSelectedItem ?? "deepseek"
-        config["provider"] = selectedProvider
-        config["model"] = model.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        config["base_url"] = baseURL.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !key.stringValue.isEmpty {
-            config["api_key"] = key.stringValue
+        config["provider"] = chosen.provider
+        config["model"] = chosen.model
+        config["base_url"] = chosen.baseURL
+        if !form.keyField.stringValue.isEmpty {
+            config["api_key"] = form.keyField.stringValue
         }
         do {
             try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -677,12 +983,26 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             .appendingPathComponent("ai_config.json")
     }
 
+    /// 找本机 Python 3（macOS 上常见的几个安装位置）。
+    private func pythonRuntimePath() -> String? {
+        let candidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                          "\(NSHomeDirectory())/.local/bin/python3", "/usr/bin/python3"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// 调用后端 CLI 时统一的环境变量（路径与编码沿用现有实现）。
+    private func backendEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONPATH"] = backendRoot().path + ":" + (environment["PYTHONPATH"] ?? "")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["REVIEWAGENT_HOME"] = environment["REVIEWAGENT_HOME"] ??
+            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
+        environment["REVIEWAGENT_CONFIG"] = modelConfigURL().standardizedFileURL.path
+        return environment
+    }
+
     private func validateModelConfiguration() -> String? {
-        let pythonCandidates = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3",
-                               "\(NSHomeDirectory())/.local/bin/python3", "/usr/bin/python3"]
-        guard let path = pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            return nil
-        }
+        guard let path = pythonRuntimePath() else { return nil }
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: path)
@@ -690,13 +1010,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         process.arguments = ["-c", "from scripts.ai_adapter import get_ai_client; c=get_ai_client(); import json; print(json.dumps({'model': c.provider_name + '/' + c.model_name}))"]
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONPATH"] = backendRoot().path + ":" + (environment["PYTHONPATH"] ?? "")
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment["REVIEWAGENT_HOME"] = environment["REVIEWAGENT_HOME"] ??
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
-        environment["REVIEWAGENT_CONFIG"] = modelConfigURL().standardizedFileURL.path
-        process.environment = environment
+        process.environment = backendEnvironment()
         do {
             try process.run()
             process.waitUntilExit()
@@ -852,13 +1166,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             return
         }
 
-        let pythonCandidates = [
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "\(NSHomeDirectory())/.local/bin/python3",
-            "/usr/bin/python3",
-        ]
-        guard let pythonPath = pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        guard let pythonPath = pythonRuntimePath() else {
             appendOutput("\n找不到 Python 3。请先安装 Python 3.7+。\n", color: .systemRed)
             setStatus("缺少 Python")
             return
@@ -901,13 +1209,7 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         process.currentDirectoryURL = workingDirectory
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        var environment = ProcessInfo.processInfo.environment
-        environment["PYTHONPATH"] = backendRoot().path + ":" + (environment["PYTHONPATH"] ?? "")
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment["REVIEWAGENT_HOME"] = environment["REVIEWAGENT_HOME"] ??
-            URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".reviewagent").path
-        environment["REVIEWAGENT_CONFIG"] = modelConfigURL().standardizedFileURL.path
-        process.environment = environment
+        process.environment = backendEnvironment()
 
         switch task {
         case .chat(let prompt, _):

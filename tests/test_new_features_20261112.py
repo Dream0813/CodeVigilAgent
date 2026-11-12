@@ -297,6 +297,15 @@ class AscendCliIntegrationTests(unittest.TestCase):
             self.assertEqual(ascend_cli._gate_exit_code({}, 'high'), 0)
             self.assertEqual(ascend_cli._gate_exit_code({'review_result': {}}, 'high'), 0)
 
+    def test_repo_root_prefers_desktop_selection(self):
+        selected = str(Path.cwd() / 'demo-repo')
+
+        class Agent:
+            desktop_repository = selected
+            work_root = Path.cwd()
+
+        self.assertEqual(ascend_cli._agent_repo_root(Agent()), selected)
+
     def test_cost_command(self):
         class Agent:
             model_config = {'model': 'demo-model'}

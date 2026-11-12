@@ -56,6 +56,17 @@ _AMB_WIDE = _ambiguous_wide()
 # 带 3 个中点的行比边框宽 3 列，右边框被顶到框外 —— 就是这一条惹的祸。
 _NARROW_CHARS = frozenset('\u2018\u2019\u201c\u201d')
 
+# 生成的宽度表：优先使用它，保证与 Node 侧（bin/width-table.js）逐码点一致。
+# 直接问 unicodedata 会随解释器 Unicode 版本漂移（15.1 → 17.0 就有 2 个码点变了），
+# 那会导致同一个字符 Python 算 1 列、Node 算 2 列，边框再次错开。
+try:
+    from . import width_table as _width_table
+except ImportError:                                     # 以脚本方式直接运行时
+    try:
+        import width_table as _width_table
+    except ImportError:
+        _width_table = None
+
 
 def char_width(ch: str) -> int:
     o = ord(ch)
@@ -68,6 +79,19 @@ def char_width(ch: str) -> int:
     if 0x2500 <= o <= 0x257F:  # ─ │ ╭ ╮ ╰ ╯ ├ ┤ ┼ 等制表符
         return 1
     if ch in _NARROW_CHARS:  # 常见引号
+        return 1
+    if _width_table is not None:
+        # 查表顺序与 bin/term-frame.js 的 charWidth() 完全一致
+        if _width_table.contains(_width_table.BOX_DRAWING, o):
+            return 1
+        if _width_table.contains(_width_table.NARROW_OVERRIDE, o):
+            return 1
+        if _width_table.contains(_width_table.ZERO, o):
+            return 0
+        if _width_table.contains(_width_table.WIDE, o):
+            return 2
+        if _width_table.contains(_width_table.AMBIGUOUS, o):
+            return 2 if _AMB_WIDE else 1
         return 1
     # 组合记号（重音符号等）/ 格式控制符（零宽连接符等）不占列。
     # 它们的 EAW 常是 A，不加这一条会和 Node 侧算得不一样。

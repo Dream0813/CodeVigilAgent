@@ -56,6 +56,25 @@ def resolve_config_file(explicit: Optional[str] = None) -> str:
     return str(config_path())
 
 
+def resolve_existing_config(explicit: Optional[str] = None) -> str:
+    """只读版 resolve_config_file：找不到就返回默认路径，但**不创建**目录或模板。
+
+    给 `model --list` 这类只读命令用 —— 列个清单不该在用户机器上写文件。
+    """
+    if explicit:
+        return str(Path(explicit).expanduser())
+    env_cfg = os.environ.get('REVIEWAGENT_CONFIG', '').strip()
+    if env_cfg:
+        return str(Path(env_cfg).expanduser())
+    home_cfg = config_path()
+    if home_cfg.exists():
+        return str(home_cfg)
+    proj = project_config_path()
+    if proj.exists():
+        return str(proj)
+    return str(home_cfg)
+
+
 def read_config(path: Optional[str] = None) -> dict:
     target = Path(resolve_config_file(path) if path is None else path)
     if not target.exists():

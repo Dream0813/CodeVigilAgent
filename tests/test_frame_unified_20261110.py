@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -196,15 +197,19 @@ class NodeParityTests(unittest.TestCase):
         规则改了却忘了重跑生成器 → Node 和 Python 的宽度会悄悄分家。
         """
         gen = ROOT / 'scripts' / 'gen_width_table.py'
-        r = subprocess.run([sys.executable, str(gen)], cwd=str(ROOT),
-                           capture_output=True, text=True, timeout=180)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        # 生成器直接覆盖原文件，跑完对比 git 里的版本是否变化由人判断；
-        # 这里至少保证生成过程中断言的段数合理、文件非空。
-        text = (ROOT / 'bin' / 'width-table.js').read_text(encoding='utf-8')
+        # 写到临时目录：以前直接覆盖仓库里的 bin/width-table.js，
+        # 用不同 Python 版本跑测试会把表改成不同 Unicode 版本的数据，
+        # 下一次换解释器就莫名其妙地失败。
+        with tempfile.TemporaryDirectory() as tmp:
+            r = subprocess.run([sys.executable, str(gen), '--out-dir', tmp],
+                               cwd=str(ROOT), capture_output=True, text=True, timeout=180)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            text = (Path(tmp) / 'bin' / 'width-table.js').read_text(encoding='utf-8')
+            py_text = (Path(tmp) / 'scripts' / 'width_table.py').read_text(encoding='utf-8')
         self.assertIn('WIDE:', text)
         self.assertIn('AMBIGUOUS:', text)
         self.assertGreater(len(text), 1000)
+        self.assertIn('def contains(', py_text)
 
     def test_char_width_parity_on_sweep(self):
         """抽样逐码点对比（全量太慢，抽 1/37 覆盖足够）。"""

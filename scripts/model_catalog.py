@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from typing import Dict, List, Optional, Tuple
 
 
@@ -269,4 +271,127 @@ def format_catalog_help() -> str:
         sample = entry['default_model']
         lines.append(f"  {entry['label']:12} 例: /model {entry['label']}  → {sample}")
     lines.append('也可直接: /model glm-4-flash  /model MiniMax-M1')
+    return '\n'.join(lines)
+
+
+def _norm_base(value: str) -> str:
+    return _norm(value).rstrip('/')
+
+
+def _text(value) -> str:
+    """配置里的值可能不是字符串（手改坏了），统一成字符串，别让 --list 崩。"""
+    if value is None:
+        return ''
+    return value if isinstance(value, str) else str(value)
+
+
+def active_model(path: Optional[str] = None) -> Dict:
+    """只读三项：provider / model / base_url。
+
+    文件不存在、JSON 坏了、顶层不是对象、字段类型怪 —— 一律降级为空串，
+    绝不让 `model --list` 因为配置文件有问题而抛异常。
+    api_key 在这里完全不读取，避免任何形式的回显。
+    """
+    from scripts.agent_home import read_config, resolve_existing_config
+
+    data: Dict = {}
+    try:
+        loaded = read_config(path or resolve_existing_config()) or {}
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+    return {key: _text(data.get(key)) for key in ('provider', 'model', 'base_url')}
+
+
+def catalog_payload(active: Optional[Dict] = None) -> Dict:
+    """CATALOG 的机器可读版本，给 `model --list --json` 与桌面端下拉框用。
+
+    唯一数据源就是本文件的 CATALOG，不额外维护第二份清单。
+    active 只取 provider / model / base_url 三个键：api_key 一律不读取、不输出。
+    """
+    raw = active if isinstance(active, dict) else {}
+    active = {key: _text(raw.get(key)) for key in ('provider', 'model', 'base_url')}
+    a_provider = _norm(active['provider'])
+    a_base = _norm_base(active['base_url'])
+
+    provider_hits: List[bool] = []
+    current_hits: List[bool] = []
+    for entry in CATALOG:
+        names = {_norm(entry['label']), _norm(entry['file_provider'])}
+        names.update(_norm(a) for a in entry.get('aliases', ()))
+        hit = bool(a_provider) and a_provider in names
+        provider_hits.append(hit)
+        if a_base:
+            current_hits.append(hit and _norm_base(entry.get('base_url') or '') == a_base)
+        else:
+            # 配置里没写 base_url 时，只有「原生适配器」条目（base_url 为空）算当前
+            current_hits.append(hit and not _norm_base(entry.get('base_url') or ''))
+
+    if not any(current_hits):
+        # 兜底：base_url 对不上时，至少把 provider 命中的第一个条目标成当前
+        for index, hit in enumerate(provider_hits):
+            if hit:
+                current_hits[index] = True
+                break
+
+    catalog = []
+    for entry, is_current in zip(CATALOG, current_hits):
+        catalog.append({
+            'label': entry['label'],
+            'file_provider': entry['file_provider'],
+            'base_url': entry.get('base_url') or '',
+            'models': list(entry['models']),
+            'default_model': entry['default_model'],
+            'aliases': list(entry.get('aliases', ())),
+            'current': bool(is_current),
+        })
+    return {
+        'catalog': catalog,
+        'active': {
+            'provider': active['provider'],
+            'model': active['model'],
+            'base_url': active['base_url'],
+        },
+    }
+
+
+def format_catalog_json(active: Optional[Dict] = None) -> str:
+    """纯 ASCII 的 JSON：Windows / macOS / Linux 内容完全一致。"""
+    return json.dumps(catalog_payload(active), ensure_ascii=True, indent=2)
+
+
+def print_catalog_json(active: Optional[Dict] = None) -> None:
+    """直接写字节流输出 JSON。
+
+    print() 走文本层，Windows 会把 '\\n' 翻译成 '\\r\\n'，重定向到文件后
+    和 macOS / Linux 的字节就不一样了。这里绕开文本层，三个平台都是 LF。
+    内容全是 ASCII，不需要经过控制台编码。
+    """
+    text = format_catalog_json(active)
+    buffer = getattr(sys.stdout, 'buffer', None)
+    if buffer is None:  # 被重定向到 StringIO（测试）时退回普通 print
+        print(text)
+        return
+    buffer.write((text + '\n').encode('ascii'))
+    buffer.flush()
+
+
+def format_catalog_list(payload: Dict) -> str:
+    """人读版清单（`model --list` 不带 --json 时用）。"""
+    lines = ['可用厂商与模型（来源: scripts/model_catalog.py CATALOG）:']
+    for entry in payload['catalog']:
+        mark = '  [当前]' if entry['current'] else ''
+        lines.append(f"  {entry['label']}（{entry['file_provider']}）{mark}")
+        for model in entry['models']:
+            suffix = '  (默认)' if model == entry['default_model'] else ''
+            lines.append(f"      {model}{suffix}")
+        if entry['base_url']:
+            lines.append(f"      base_url: {entry['base_url']}")
+    active = payload['active']
+    lines.append(
+        f"当前配置: provider={active['provider'] or '(未设置)'} "
+        f"model={active['model'] or '(未设置)'} "
+        f"base_url={active['base_url'] or '(默认)'}"
+    )
     return '\n'.join(lines)

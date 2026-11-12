@@ -278,3 +278,89 @@ python ascend_cli.py review --staged --offline --fail-on high
 | 自定义命令 | `/commands` 列出 3 个项目级命令；`/并发 src/foo.py` 正确展开 |
 | 文件引用 | `@scripts/usage_meter.py` 实际附带 2.5 KB 正文 |
 | 用量 | `/cost` 输出调用次数与 token 估算 |
+
+---
+
+## 十一、便利功能（2026-11-12 晚）
+
+> 需求：加点和审查无关、纯为「用起来省事」的功能。
+> 全部在 Python CLI 层，零第三方依赖，三个系统都有对应实现。
+
+| 功能 | 命令 | 解决什么麻烦 |
+|------|------|-------------|
+| 打开目录 | `open config/sessions/backups/repo/<路径>` | 不用记 `~/.reviewagent` 在哪 |
+| 配置备份/回滚 | `config --backup/--backups/--restore` | 改错 key 不用重配；`--set` 前自动备份 |
+| 复制回答 | `/copy` | 不用手动拖选、怕漏字 |
+| 拼错提示 | 未知命令时自动推荐 | `/revew` → `/review` |
+
+### 11.1 跨平台实现
+
+| 能力 | Windows | macOS | Linux |
+|------|---------|-------|-------|
+| 打开 | `os.startfile` | `open` | `xdg-open` |
+| 剪贴板 | ctypes 调 user32 | `pbcopy` | `wl-copy` / `xclip` / `xsel` |
+
+都没有用 shell 字符串拼命令（避免空格/中文路径被拆开），失败一律返回原因、不抛异常。
+
+### 11.2 备份策略
+
+- 位置：`~/.reviewagent/backups/`，可用 `REVIEWAGENT_BACKUP_DIR` 覆盖（测试用）
+- 命名：`ai_config.<时间戳>.<manual|auto|before-restore>.json`
+- 保留：最近 20 份，自动清理更早的
+- 恢复：默认最近一份，也可按名字片段；恢复前先把当前配置再存一份
+
+### 11.3 验证
+
+| 项 | 结果 |
+|---|---|
+| 新增测试 | 21 项 |
+| 全量回归 | **356 项全部通过** |
+| 真实剪贴板 | 写入后读回一致，测试完已还原原内容 |
+| 真实备份 | `config --backup` 生成 1157 字节备份并列出 |
+| 拼错提示 | `/revew` → 「你是不是想输入 /review ？」 |
+
+---
+
+## 十二、结构治理（2026-11-12 晚）
+
+> 起因：评审「整体结构拥挤，加新功能会互相影响」；而当天下午新加的四条
+> 斜杠命令又被塞进了 `handle_chat_slash()`，函数涨到 660 行 —— 老问题复发。
+
+### 12.1 注册表：新命令不再改入口
+
+- 新增 `scripts/cli_commands/`：一个文件一条命令，`COMMANDS = {'/名字': 函数}`
+- `pkgutil` 自动发现；内置命令优先，不会被同名扩展抢占
+- 已迁入 `/copy` `/dir` `/cost` `/commands`
+- `handle_chat_slash()` 660 → 628 行，并设 640 行预算锁死
+
+### 12.2 结构守卫：让拥挤在测试里失败
+
+`tests/test_structure_guard.py`（10 项）：
+
+| 规则 | 阈值 |
+|---|---|
+| 关键文件行数 | `ascend_cli.py` ≤1820、`chat_v2.py` ≤800、`smart_reviewer.py` ≤830 等 |
+| 单函数行数 | `handle_chat_slash` ≤640 |
+| 分层方向 | `scripts/` 不许 import `ascend_cli`；`cvapp/` 同 |
+| 注册表约定 | `cli_commands/*.py` 必须声明 `COMMANDS` |
+| 根目录文件数 | ≤20（现 19） |
+
+### 12.3 顺手修掉的命名冲突
+
+`/open` 原本是内置「打开历史会话」的别名；便利命令抢占后，内置优先规则
+让它永远不生效。已改名 `/dir`（别名 `/reveal`），并把 `/open` 锁进守卫的
+内置名单，防止再次抢占。
+
+### 12.4 规则落地位置
+
+| 文件 | 读者 |
+|---|---|
+| `CodeVigilAGENTS.md` | 未来的 AI / 协作者 |
+| `.workbuddy/memory/MEMORY.md` | 下一次会话的助手 |
+| `docs/ARCHITECTURE.md` | 评审 / 新人 |
+
+### 12.5 验证
+
+- 全量 **374 项通过**
+- 注册表 10 项守卫全过
+- `/copy` `/dir` `/cost` `/commands` 可用；`/review` `/open` 等内置不被抢占

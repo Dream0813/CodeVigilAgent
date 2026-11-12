@@ -121,16 +121,43 @@ stats_parser.set_defaults(func=stats_cmd)
 
 ## 场景三：给对话加一个斜杠命令
 
-`/xxx` 这类命令在 `ascend_cli.py` 的 `handle_chat_slash()` 里分发。
+> **不要**再往 `ascend_cli.py` 的 `handle_chat_slash()` 里加 if 了 ——
+> 那个函数已经 600 多行，正是「结构拥挤」的来源。新命令放注册表目录。
+
+### 第 1 步：新建文件
+
+`scripts/cli_commands/stats.py`
 
 ```python
-if cmd == '/stats':
-    from scripts.session_store import list_sessions
-    return f'当前共 {len(list_sessions())} 个会话'
+"""会话统计命令。"""
+from scripts.session_store import list_sessions
+from . import SlashContext
+
+def show_stats(ctx: SlashContext, arg: str) -> None:
+    print(f'当前共 {len(list_sessions())} 个会话')
+
+COMMANDS = {'/stats': show_stats}
 ```
 
-然后在 `tests/test_chat_slash.py` 里加一条用例。
-帮助文案在 `_slash_cmd()` 里同步更新，否则 `/help` 看不到新命令。
+### 第 2 步：完成
+
+重启后 `/stats` 自动可用：
+
+- 不需要改 `ascend_cli.py`
+- 不需要在别处登记（`pkgutil` 自动发现）
+- 内置命令优先：同名不会抢占 `/review`、`/help` 等
+- 某个模块导入失败只跳过并记警告，不影响其它命令
+
+### 第 3 步：加测试
+
+在 `tests/` 下断言：`load_handlers()` 里有这个命令、`dispatch()` 返回 True。
+`tests/test_structure_guard.py` 会自动检查新模块是否声明了 `COMMANDS`。
+
+### 命名注意
+
+先查内置命令表。踩过一次：便利命令原本叫 `/open`，
+但 `/open` 已是「打开历史会话」的内置别名，内置优先导致它永远不生效，
+最后改名为 `/dir`。结构守卫里已经把 `/open` 锁进内置名单，防止再犯。
 
 ---
 

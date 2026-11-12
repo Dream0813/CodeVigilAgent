@@ -34,6 +34,12 @@ CodeVigilAgent/
 │   ├── file_mentions.py               #   @文件引用解析
 │   ├── git_hooks.py                   #   pre-commit 钩子安装
 │   ├── usage_meter.py                 #   /cost 用量估算
+│   ├── system_open.py                 #   open 命令（跨平台打开目录）
+│   ├── clipboard.py                   #   /copy 跨平台剪贴板
+│   ├── config_backup.py               #   配置备份 / 回滚
+│   ├── cli_commands/                  #   斜杠命令注册表（新命令放这里）
+│   │   ├── __init__.py               #     自动发现 + dispatch
+│   │   └── convenience.py            #     /copy /dir /cost /commands
 │   ├── frame_doctor.py                #   边框体检（不需要 API Key）
 │   └── ...                            #   知识库、MCP、数据采集
 │

@@ -30,6 +30,10 @@ CodeVigilAgent/
 │   ├── ai_adapter.py                  #   多模型适配
 │   ├── github_fetcher.py              #   PR / Issue 抓取
 │   ├── session_store.py               #   会话持久化
+│   ├── custom_commands.py             #   自定义斜杠命令（.reviewagent/commands）
+│   ├── file_mentions.py               #   @文件引用解析
+│   ├── git_hooks.py                   #   pre-commit 钩子安装
+│   ├── usage_meter.py                 #   /cost 用量估算
 │   ├── frame_doctor.py                #   边框体检（不需要 API Key）
 │   └── ...                            #   知识库、MCP、数据采集
 │
@@ -57,6 +61,7 @@ CodeVigilAgent/
 ├── docs/                              # 设计、使用、架构文档
 ├── launchers/                         # 次要启动脚本（兼容模式 / 边框体检 / 新用户）
 ├── legacy/                            # 已退役入口，仅留档
+├── .reviewagent/commands/             # 项目级自定义命令（/并发 /报错 /补测试）
 ├── config/                            # 默认配置模板
 ├── data/                              # 知识库与采集数据
 │

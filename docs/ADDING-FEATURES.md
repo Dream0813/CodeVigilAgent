@@ -134,6 +134,43 @@ if cmd == '/stats':
 
 ---
 
+## 场景四：写一个自定义命令（不改代码）
+
+如果只是想把某类提问固定下来，**不需要改 Python**——放一个 Markdown 就行。
+
+### 第 1 步：新建文件
+
+`<仓库>/.reviewagent/commands/安全.md`（随仓库共享）
+或 `~/.reviewagent/commands/安全.md`（所有项目可用）
+
+```markdown
+---
+description: 按 OWASP 检查这段代码
+argument-hint: <文件路径>
+---
+请按 OWASP Top 10 检查 @$ARGUMENTS：
+1. 注入（SQL / 命令 / 路径穿越）
+2. 认证与会话
+3. 敏感数据是否进日志
+只报真实风险，给出最小修复。
+```
+
+### 第 2 步：直接用
+
+```text
+/安全 src/api.py
+/commands          # 确认它被识别到了
+```
+
+- `$ARGUMENTS` 会被替换成命令后面的参数；没写占位符时参数附在末尾
+- 子目录会变成命名空间：`commands/db/slow.md` → `/db:slow`
+- 项目级同名命令覆盖用户级
+- 命名冲突不会抢占内置命令（`/help`、`/review` 等始终优先）
+
+> 正文里可以写 `@文件`，执行时会自动附带文件内容——和第 1 步的组合是常用玩法。
+
+---
+
 ## 提交前检查清单
 
 ```bat

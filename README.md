@@ -82,8 +82,50 @@ python ascend_cli.py review --json --output report.json
 Windows 下也可以直接运行：
 
 ```bat
-ascend.bat review
+launchers\ascend.bat review
 ```
+
+### 四个效率能力（2026-11-12 新增）
+
+**1. 自定义斜杠命令** —— 把常用提问存成 Markdown，随仓库共享（参考 Claude Code 的 `.claude/commands`）：
+
+```text
+.reviewagent/commands/并发.md     →  /并发 <文件>
+.reviewagent/commands/db/slow.md  →  /db:slow    （子目录=命名空间）
+```
+
+```text
+/commands            # 列出所有命令（项目级 + 用户级 ~/.reviewagent/commands）
+/并发 src/server.py   # 正文里的 $ARGUMENTS 会替换成参数
+```
+
+**2. `@文件` 引用** —— 直接把仓库文件内容带进对话（参考 Cursor / aider `/read`）：
+
+```text
+这个函数为什么会泄漏？@src/server.py
+对比一下 @src/old.py 和 @src/new.py
+@scripts/            # 目录会列成清单
+```
+
+只允许仓库内路径，单文件上限 64 KB，一次最多 8 个，二进制自动跳过。
+
+**3. 提交前门禁** —— 装一个钩子，`git commit` 前自动跑离线审查（不需要 API Key）：
+
+```bash
+python ascend_cli.py install-hook --severity high   # 安装
+python ascend_cli.py install-hook --remove          # 卸载
+python ascend_cli.py review --staged --offline --fail-on high   # 手动跑
+```
+
+有 `high` 及以上问题时退出码为 1，提交被阻止；阈值可选 `low/medium/high/critical`。
+
+**4. 用量估算** —— 会话内 `/cost` 查看本轮调用量（参考 Claude Code `/cost`）：
+
+```text
+/cost     # 调用次数 / 输入输出 token 估算
+```
+
+按中英文分别估算，不报金额（各网关单价差异太大）。
 
 ### 本地昇腾案例检索
 

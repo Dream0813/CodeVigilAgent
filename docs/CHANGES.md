@@ -204,3 +204,77 @@ desktop-app/win/
 | CLI 冒烟 | `--version` / `doctor` 正常 |
 | 边框体检 | 4 块全部对齐 |
 | 桌面版 | 新布局截图核对：侧边栏、输出区、输入行均完整可见 |
+
+---
+
+## 十、新增四个能力（2026-11-12 下午）
+
+> 做法：先看同类 Agent 有什么，再挑本项目真正缺的。
+> 参考对象：Claude Code（自定义命令 / `/cost`）、Cursor（`@文件`）、
+> aider（`/read`、lint 钩子）、CodeRabbit（pre-merge checks）。
+
+| 功能 | 参考 | 实现 | 为什么值得加 |
+|------|------|------|-------------|
+| 自定义斜杠命令 | Claude Code `.claude/commands` | `scripts/custom_commands.py` + `.reviewagent/commands/` | 常用提问不用每次重打；随仓库共享，团队复用 |
+| `@文件` 引用 | Cursor / aider `/read` | `scripts/file_mentions.py` | 审查对话时能精确指文件，比"贴一大段代码"省 token |
+| 提交前门禁 | CodeRabbit pre-merge checks | `review --fail-on` + `scripts/git_hooks.py` + `install-hook` | 把"审一遍"从人工动作变成 git 流程的一部分 |
+| 会话用量估算 | Claude Code `/cost`、aider `/tokens` | `scripts/usage_meter.py` + `/cost` | 长会话心里有数，避免无意烧 token |
+
+### 10.1 自定义命令
+
+```
+.reviewagent/commands/并发.md     → /并发 <文件>
+.reviewagent/commands/db/slow.md  → /db:slow
+```
+
+- frontmatter 支持 `description` / `argument-hint`
+- `$ARGUMENTS` / `${ARGUMENTS}` 占位符；没有占位符时参数附在末尾
+- 项目级覆盖用户级；内置命令优先，不会被同名自定义命令抢占
+- 单文件 64 KB、最多 200 个命令，解析失败只警告不崩
+
+仓库内已带 3 个示例：`/并发`、`/报错`、`/补测试`。
+
+### 10.2 `@文件` 引用
+
+```
+这个函数为什么会泄漏？@src/server.py
+对比 @src/old.py 和 @src/new.py
+@scripts/ 目录里有哪些入口？
+```
+
+- 只允许仓库内路径（`..` 越界、绝对路径越界都拒绝）
+- 单文件 ≤64 KB，一次 ≤8 个，目录最多列 100 项
+- 二进制（含 NUL）跳过；找不到只警告，不中断对话
+- 中文标点紧跟路径也能正确识别（`@a.py，` → `a.py`）
+
+### 10.3 提交前门禁
+
+```bash
+python ascend_cli.py install-hook --severity high
+python ascend_cli.py review --staged --offline --fail-on high
+```
+
+- 钩子带固定标记，重复安装只更新；卸载只删自己写的
+- 遇到第三方钩子默认拒绝覆盖，`--force` 会先备份
+- 兼容 worktree / `core.hooksPath`（用 `git rev-parse --git-path hooks` 定位）
+- `--fail-on` 默认 `none`，**不改变既有行为**；只有显式指定才影响退出码
+
+### 10.4 `/cost`
+
+```
+/cost  →  调用次数 / 输入输出 token 估算 / 合计
+```
+
+中英文分开估算（中文 1 字≈1 token，其它 4 字符≈1 token）。
+不显示金额：各网关单价差异太大，报假数字比不报更糟。
+
+### 10.5 验证
+
+| 项 | 结果 |
+|---|---|
+| 新增测试 | 31 项（4 个功能 + CLI 集成） |
+| 全量回归 | **317 项全部通过**（原 286 + 新 31） |
+| 端到端门禁 | 临时仓库装钩子 → 提交含 `bare except` 的文件 → **退出码 1，提交被阻止**，HEAD 未前进 |
+| 自定义命令 | `/commands` 列出 3 个项目级命令；`/并发 src/foo.py` 正确展开 |
+| 文件引用 | `@scripts/usage_meter.py` 实际附带 2.5 KB 正文 |
+| 用量 | `/cost` 输出调用次数与 token 估算 |

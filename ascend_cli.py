@@ -55,12 +55,95 @@ from scripts.ci_log_analyzer import analyze_ci_log, format_ci_report
 from scripts.chat_review import run_local_review
 from scripts.context_compare import compare_contexts, format_compare_report
 from scripts import git_work
+from scripts.custom_commands import expand_command, find_command, format_commands, load_commands
+from scripts.file_mentions import expand as expand_mentions
+from scripts.git_hooks import HookError, SEVERITIES, install as install_hook, remove as remove_hook
+from scripts.usage_meter import UsageMeter
+
+# 本次进程内的模型调用量（/cost 使用）；跨进程不持久化，够用且不引入状态文件
+_USAGE = UsageMeter()
 
 
 def _default_config(cli_value: str = None) -> str:
     if cli_value and cli_value not in ('unused.json',):
         return cli_value
     return resolve_config_file(None)
+
+
+def _agent_repo_root(agent=None) -> str:
+    """取 @文件引用 / 自定义命令的项目根：优先 Agent 的 work_root。"""
+    root = getattr(agent, 'work_root', None)
+    if root:
+        return str(root)
+    return os.getcwd()
+
+
+def _prepare_message(text: str, repo_root: str, quiet: bool = False) -> str:
+    """展开消息里的 @文件引用，并把附带/警告打印出来（JSON 模式保持静默）。"""
+    expanded, notes, warnings = expand_mentions(text, repo_root)
+    if not quiet:
+        for note in notes:
+            print(mute(f'  · {note}'))
+        for warning in warnings[:5]:
+            print(warn(f'  · {warning}'))
+    return expanded
+
+
+def _expand_once_message(text: str, repo_root: str) -> str:
+    """一次性 --message：支持 /自定义命令 与 @文件。内置斜杠命令不在这里处理。"""
+    if not text:
+        return text
+    if text.startswith('/'):
+        commands, warnings = load_commands(repo_root)
+        command, cmd_args = find_command(text, commands)
+        if command is not None:
+            for warning in warnings[:3]:
+                print(warn(f'  · {warning}'))
+            print(mute(f'▸ 自定义命令 /{command.name}（{command.source}）'))
+            text = expand_command(command, cmd_args)
+    return text
+
+
+def _severity_rank(value: str) -> int:
+    return {'low': 1, 'medium': 2, 'high': 3, 'critical': 4}.get(str(value or '').lower(), 0)
+
+
+def _gate_exit_code(report: dict, threshold: str) -> int:
+    """--fail-on：有达到阈值的问题时返回 1，否则 0。"""
+    if not threshold or threshold == 'none':
+        return 0
+    result = report.get('review_result') if isinstance(report, dict) else None
+    issues = result.get('issues') if isinstance(result, dict) else None
+    if not isinstance(issues, list):
+        return 0
+    floor = _severity_rank(threshold)
+    hits = [i for i in issues if isinstance(i, dict) and _severity_rank(i.get('severity')) >= floor]
+    if hits:
+        print(f'[GATE] 发现 {len(hits)} 个 {threshold} 及以上问题，按 --fail-on 返回失败。',
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def install_hook_cmd(args: argparse.Namespace) -> int:
+    repo = os.path.abspath(args.repo or '.')
+    try:
+        if args.remove:
+            path, action = remove_hook(repo)
+            print(f'[HOOK] {path}：{action}')
+            return 0
+        path, action = install_hook(
+            repo, python=sys.executable,
+            cli=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ascend_cli.py'),
+            severity=args.severity, force=args.force,
+        )
+    except HookError as exc:
+        print(f'[ERROR] {exc}')
+        return 1
+    print(f'[HOOK] {path}（{action}）')
+    print(f'  触发：git commit 时对暂存区跑离线审查，有 {args.severity} 及以上问题则阻止提交')
+    print('  卸载：python ascend_cli.py install-hook --remove')
+    return 0
 
 
 def sessions_cmd(args: argparse.Namespace) -> int:
@@ -246,7 +329,11 @@ def review(args: argparse.Namespace) -> int:
             reviewer.print_report(report)
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 1 if report_error or (isinstance(result, dict) and result.get("error")) else 0
+    code = 1 if report_error or (isinstance(result, dict) and result.get("error")) else 0
+    if code == 0:
+        # --fail-on：给 CI / pre-commit 用的质量门禁；默认 none 不改变既有行为
+        code = _gate_exit_code(report, getattr(args, "fail_on", "none"))
+    return code
 
 
 def test(args: argparse.Namespace) -> int:
@@ -1018,6 +1105,19 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(mute('用法: /mcp | /mcp tools ascend-doc | /mcp call ascend-doc <tool> {} | /mcp reload'))
         return 'handled'
 
+    if cmd in ('/commands', '/cmds'):
+        commands, warnings = load_commands(_agent_repo_root(agent))
+        print(format_commands(commands.values()))
+        for warning in warnings[:5]:
+            print(warn(f'  · {warning}'))
+        return 'handled'
+
+    if cmd in ('/cost', '/tokens', '/usage'):
+        config = getattr(agent, 'model_config', None)
+        model = config.get('model') if isinstance(config, dict) else None
+        print(_USAGE.report(model))
+        return 'handled'
+
     if cmd == '/help':
         print(brand('审核 / 质检怎么用'))
         print(ok('0) AI自动调换（默认）'))
@@ -1048,12 +1148,36 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(ok('6) 其它'))
         print(mute('   /status /history /retry /export /review /ci /checklist /compare'))
         print(mute('   /save /resume /sessions clean · /new /back'))
+        print(mute('   自定义命令: /commands 查看；在 .reviewagent/commands 放 .md 即可新增'))
+        print(mute('   @文件 附带内容: 例如 "看下 @src/server.py 的锁"'))
+        print(mute('   用量: /cost（本次会话估算）'))
         print(mute('退出: exit / /exit / Ctrl+C（自动存会话）'))
         print(mute('/discard /context /sources /clear · /network auto|on|off'))
         return 'handled'
 
     if cmd in ('/paste', '/p', '/send', '/cancel'):
         print(warn('请在输入框使用该命令：/paste 进入多行，结束后 /send（或 /cancel）。'))
+        return 'handled'
+
+    # 自定义命令：项目级 .reviewagent/commands 或用户级 ~/.reviewagent/commands
+    # 放在内置命令之后判断，避免自定义命令抢占 /review、/model 等保留名。
+    repo_root = _agent_repo_root(agent)
+    commands, command_warnings = load_commands(repo_root)
+    command, command_args = find_command(text, commands)
+    if command is not None:
+        for warning in command_warnings[:3]:
+            print(warn(f'  · {warning}'))
+        prompt = _prepare_message(expand_command(command, command_args), repo_root)
+        print(mute(f'▸ 自定义命令 /{command.name}（{command.source}）'))
+        begin_think(f'/{command.name}')
+        try:
+            reply = agent.answer(prompt)
+        except Exception as exc:                       # noqa: BLE001
+            end_think('失败')
+            print(warn(f'执行失败: {exc}'))
+            return 'handled'
+        end_think('回答就绪')
+        _print_agent_reply(reply)
         return 'handled'
 
     # Unknown slash — still "handled" so we don't send "/foo" to the model as a review
@@ -1145,6 +1269,9 @@ def chat(args: argparse.Namespace) -> int:
     if args.multiline:
         print(warn('已开启多行模式：回车换行，/send 发送，/cancel 取消。'))
     if args.message:
+        repo_root = _agent_repo_root(agent)
+        message = _expand_once_message(args.message, repo_root)
+        message = _prepare_message(message, repo_root, quiet=getattr(args, 'json', False))
         if not getattr(args, "json", False):
             begin_think('思考中')
         turn = None
@@ -1168,7 +1295,7 @@ def chat(args: argparse.Namespace) -> int:
                     print(json.dumps({'ok': False, 'error': '无法在本机保存会话。'}, ensure_ascii=False))
                 return 1
         try:
-            reply = agent.answer(args.message)
+            reply = agent.answer(message)
         except Exception:
             reply = 'Agent 请求失败；请检查服务配置或网络后重试。'
             agent.last_ok = False
@@ -1177,6 +1304,7 @@ def chat(args: argparse.Namespace) -> int:
             if not getattr(args, "json", False):
                 end_think('回答就绪')
         reply = redact_secrets(reply, agent)
+        _USAGE.record(message, reply)
         if turn is not None:
             turn['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
             if agent.last_ok:
@@ -1233,6 +1361,8 @@ def chat(args: argparse.Namespace) -> int:
             return 0
         if action == 'handled':
             continue
+        # @文件引用：把仓库里的文件内容附到消息后面（只读，不允许越出仓库）
+        text = _prepare_message(text, _agent_repo_root(agent))
         begin_think('思考中')
         interrupted = False
         reply = ''
@@ -1245,6 +1375,7 @@ def chat(args: argparse.Namespace) -> int:
             print('\n' + ok('已退出对话。'))
             _autosave_session(agent)
             return 0
+        _USAGE.record(text, reply)
         _print_agent_reply(reply)
 
 
@@ -1423,7 +1554,20 @@ def main() -> int:
                                help="加载专业 Agent：operator=算子，inference=推理，opengauss=openGauss 社区；省略则自动判定")
     review_parser.add_argument("--require-scenario", action="store_true",
                                help="自动判定含糊时返回 needs_context（退出码 2），不进行通用审查")
+    review_parser.add_argument("--fail-on", choices=["none", "low", "medium", "high", "critical"],
+                               default="none",
+                               help="有达到该严重级别的问题时退出码为 1（CI / pre-commit 门禁）")
     review_parser.set_defaults(func=review)
+
+    hook_parser = subparsers.add_parser(
+        'install-hook', help='安装/卸载 git pre-commit 钩子（提交前自动离线审查）')
+    hook_parser.add_argument('--repo', default='.', help='仓库路径（默认当前目录）')
+    hook_parser.add_argument('--severity', choices=list(SEVERITIES), default='high',
+                             help='达到该级别就阻止提交（默认 high）')
+    hook_parser.add_argument('--force', action='store_true',
+                             help='覆盖已有的第三方 pre-commit（会先备份）')
+    hook_parser.add_argument('--remove', action='store_true', help='卸载本工具生成的钩子')
+    hook_parser.set_defaults(func=install_hook_cmd)
 
     test_parser = subparsers.add_parser("test", help="运行项目测试")
     test_parser.add_argument("--path", default=".")

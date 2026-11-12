@@ -55,6 +55,10 @@
 | `scripts/term_ui.py` | 终端颜色 / 字形 / 盒子绘制 | 一般不动 |
 | `scripts/term_frame.py` | **宽度计算的唯一出处**（定位渲染 + 补空格兜底） | 一般不动 |
 | `scripts/smart_reviewer.py` | 审查主流程 | 加审查规则时会 |
+| `scripts/custom_commands.py` | 自定义斜杠命令（读 `.reviewagent/commands`） | 一般不动 |
+| `scripts/file_mentions.py` | `@文件` 引用解析与安全边界 | 一般不动 |
+| `scripts/git_hooks.py` | pre-commit 钩子安装/卸载 | 一般不动 |
+| `scripts/usage_meter.py` | `/cost` 用量估算 | 一般不动 |
 | `desktop-app/win/app.py` | 桌面版入口，20 行 | 不动 |
 | `desktop-app/win/cvapp/shell.py` | 窗口骨架：侧边栏 + 工作区 | 一般不动 |
 | `desktop-app/win/cvapp/features/` | **桌面版功能注册表** | 加桌面功能只动这里 |
@@ -107,6 +111,18 @@ FEATURES = [
 一个模块导入失败只会被跳过并显示在状态栏，不会拖垮整个窗口。
 
 详见 [ADDING-FEATURES.md](ADDING-FEATURES.md)。
+
+### 不改代码的扩展点
+
+用户侧还有三个「连 Python 都不用改」的入口：
+
+| 扩展点 | 加什么 | 怎么加 |
+|--------|--------|--------|
+| `.reviewagent/commands/*.md` | 自定义斜杠命令（`/并发`、`/报错`…） | 放一个 Markdown，`/commands` 立即可见；正文可用 `$ARGUMENTS` |
+| 消息里的 `@路径` | 把仓库文件内容带进对话 | 直接写 `@src/a.py`；只允许仓库内、单文件 ≤64 KB、每次 ≤8 个 |
+| `install-hook` | 提交前自动离线审查 | `python ascend_cli.py install-hook --severity high`；`--fail-on` 控制退出码 |
+
+会话用量用 `/cost` 查看（字符级估算，不报金额）。
 
 ---
 

@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.ai_adapter import get_ai_client
+from scripts.ai_adapter import get_ai_client, non_json_reply
 from scripts.knowledge_search import KnowledgeSearch, PROJECT_ROOT
 from scripts.repo_context import decode_git_path
 
@@ -97,11 +97,14 @@ class SmartReviewer:
         try:
             self.ai_client = get_ai_client(config_file)
             self.has_ai = True
-        except:
+            self.ai_error = ''
+        except Exception as exc:                       # noqa: BLE001
+            # 不吞原因：降级到规则引擎时要能看出是"没配 key"还是"配置读不到"
             self.ai_client = None
             self.has_ai = False
+            self.ai_error = str(exc)
             if verbose:
-                print("⚠️  AI 未配置，将使用规则引擎")
+                print(f"⚠️  AI 未配置，将使用规则引擎（{exc}）")
 
         # 加载知识库；缺失的数据文件记入 data_warnings，不静默当作空数据
         self.data_warnings: List[str] = []
@@ -383,8 +386,17 @@ class SmartReviewer:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=0.3,  # 更确定的输出
-                max_tokens=3000
+                max_tokens=16000  # deepseek-flash 等推理模型会先用掉几千 tokens 思考，
+                                  # 3000 时正文为空、8000 时 JSON 写一半就断
             )
+
+            # 适配层在"正文为空 / 被截断 / HTTP 出错"时返回一句可读说明，
+            # 直接丢给 json.loads 只会得到 "Expecting value: line 1 column 1 (char 0)"，
+            # 用户完全看不出发生了什么，所以先认出来。
+            bad = non_json_reply(response)
+            if bad:
+                return {'error': bad, 'raw_response': response,
+                        'truncated': ('正文为空' in bad or '截断' in bad)}
 
             # 解析 JSON
             if '```json' in response:
@@ -400,9 +412,16 @@ class SmartReviewer:
 
         except ValueError as e:
             # json.JSONDecodeError 和格式校验失败都是 ValueError：明确报错，不当作"无问题"
+            hint = ''
+            try:
+                hint = self.ai_client.truncation_hint()
+            except AttributeError:
+                hint = ''
             return {
-                'error': f'AI 返回内容无法作为有效审查结果: {e}',
-                'raw_response': response if 'response' in locals() else None
+                'error': f'AI 返回内容无法作为有效审查结果: {e}'
+                         + (f'\n{hint}' if hint else ''),
+                'raw_response': response if 'response' in locals() else None,
+                'truncated': bool(hint),
             }
         except Exception as e:
             return {

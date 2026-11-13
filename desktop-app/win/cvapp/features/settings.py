@@ -65,16 +65,44 @@ def open_settings(app) -> None:
     body.grid_columnconfigure(1, weight=1)
 
     choices, load_error = _load_choices(provider0, model0)
-    state = {'choices': choices}
+    # 打开对话框时的 base_url，用来判断用户是否真的换了厂商
+    # （换厂商就必须换密钥：qwen 的 key 拿到 dashscope 上是 401）
+    original_base = str(cfg.get('base_url') or '').strip().rstrip('/')
+    state = {
+        'choices': choices,
+        'saved_key': str(cfg.get('api_key') or ''),   # 原配置里的密钥，切回原厂商时恢复
+        'key_missing': False,                         # 已换厂商但还没填新密钥
+    }
     custom_title = choices.get('custom_title') or CUSTOM_FALLBACK_TITLE
 
+    # Windows 默认的 vista 主题会忽略 Combobox 的 fieldbackground/foreground，
+    # 结果就是白底 + 系统浅灰字，深色界面下几乎看不清。clam 主题才吃这些配置。
+    # theme_use 是全局的，这里对 Scrollbar 一并补色，避免主窗口滚动条变回浅色。
     style = ttk.Style(win)
+    try:
+        style.theme_use('clam')
+    except tk.TclError:
+        pass                                        # 没有 clam 就沿用系统主题，不影响功能
     style.configure('Ra.TCombobox', fieldbackground=theme.PANEL,
                     background=theme.PANEL, foreground=theme.FG,
-                    arrowcolor=theme.FG_DIM)
+                    arrowcolor=theme.FG_DIM, selectbackground=theme.PANEL,
+                    selectforeground=theme.FG, bordercolor=theme.BORDER,
+                    lightcolor=theme.PANEL, darkcolor=theme.PANEL,
+                    padding=4)
     style.map('Ra.TCombobox',
-              fieldbackground=[('readonly', theme.PANEL)],
-              foreground=[('readonly', theme.FG)])
+              fieldbackground=[('readonly', theme.PANEL), ('disabled', theme.BG)],
+              foreground=[('readonly', theme.FG), ('disabled', theme.FG_FAINT)],
+              selectbackground=[('readonly', theme.PANEL)],
+              selectforeground=[('readonly', theme.FG)])
+    style.configure('TScrollbar', background=theme.PANEL_HI,
+                    troughcolor=theme.BG, bordercolor=theme.BORDER,
+                    arrowcolor=theme.FG_DIM)
+    # 下拉弹层是原生 Listbox，样式只能用 option 数据库
+    win.option_add('*TCombobox*Listbox.background', theme.PANEL_HI)
+    win.option_add('*TCombobox*Listbox.foreground', theme.FG)
+    win.option_add('*TCombobox*Listbox.selectBackground', theme.ACCENT_DIM)
+    win.option_add('*TCombobox*Listbox.selectForeground', theme.BG)
+    win.option_add('*TCombobox*Listbox.font', theme.ui_font(11))
 
     def row_label(row: int, text: str) -> None:
         tk.Label(body, text=text, bg=theme.BG, fg=theme.FG_DIM,
@@ -98,9 +126,11 @@ def open_settings(app) -> None:
         widget.grid(row=row, column=1, sticky='ew', padx=(16, 0), ipady=4)
         return widget
 
+    # wraplength 要略小于输入框宽度：设太小会带出「API / Key」这种断词，
+    # 而且提示文字一变长窗口就跟着变宽、控件跟着跳。
     hint = tk.Label(body, text='', bg=theme.BG, fg=theme.FG_FAINT,
                     font=theme.ui_font(10), anchor='w', justify='left',
-                    wraplength=380)
+                    wraplength=460)
 
     if choices.get('options'):
         row_label(0, '服务商')
@@ -146,9 +176,26 @@ def open_settings(app) -> None:
 
             state['choices'] = select_provider(state['choices'], provider_cb.current())
             refresh_models()
+            new_base = str(state['choices']['base_url'] or '').strip().rstrip('/')
             # 切厂商自动带出该厂商 base_url，用户之后仍可改
             base_entry.delete(0, 'end')
             base_entry.insert(0, state['choices']['base_url'])
+            # 换了厂商 → 旧密钥对新厂商一定无效（各家 key 不通用）。
+            # 不清掉的话，用户会看到一串星号以为已经填好了，保存后必然 401。
+            if new_base != original_base:
+                if key_entry.get().strip():
+                    key_entry.delete(0, 'end')
+                state['key_missing'] = True
+                label = state['choices']['options'][provider_cb.current()]['label'] \
+                    if 0 <= provider_cb.current() < len(state['choices']['options']) else ''
+                hint.configure(
+                    text=f'已切换到 {label}\n旧密钥已清空，请填写 {label} 的 API Key。',
+                    fg=theme.DANGER)
+            else:
+                if not key_entry.get().strip() and state['saved_key']:
+                    key_entry.insert(0, state['saved_key'])
+                state['key_missing'] = False
+                hint.configure(text=list_hint_text, fg=theme.FG_FAINT)
 
         def on_model(_event=None) -> None:
             from scripts.model_choices import select_model
@@ -179,9 +226,10 @@ def open_settings(app) -> None:
         provider_cb.bind('<<ComboboxSelected>>', on_provider)
         model_cb.bind('<<ComboboxSelected>>', on_model)
         refresh_models()
-        hint.configure(text=f'模型清单来自终端（{len(choices["options"])} 个厂商）；'
-                            f'清单里没有的模型直接写在「自定义模型」里。',
-                       fg=theme.FG_FAINT)
+        # 手动换行，不让 tk 自己在「12」和「个厂商」之间断
+        list_hint_text = (f'模型清单来自终端：{len(choices["options"])} 个厂商\n'
+                          f'清单里没有的模型，直接写在「自定义模型」里')
+        hint.configure(text=list_hint_text, fg=theme.FG_FAINT)
         degrade = False
         last_row = 5
     else:
@@ -191,7 +239,7 @@ def open_settings(app) -> None:
         provider_cb = model_cb = None
         row_label(1, 'API 地址')
         base_entry = make_entry(1, str(cfg.get('base_url') or ''))
-        hint.configure(text=f'无法读取模型清单（{load_error}），已改为手动输入。',
+        hint.configure(text=f'无法读取模型清单：{load_error}\n已改为手动输入，保存不会改动其它配置。',
                        fg=theme.DANGER)
         degrade = True
         last_row = 3
@@ -211,17 +259,33 @@ def open_settings(app) -> None:
             picked = resolve(state['choices'], model_cb.current(), custom_entry.get(),
                              prefer_custom=True)
         if not picked or not picked[1]:
-            hint.configure(text='模型不能为空：请在下拉里选一个，或选「自定义模型…」后填写名称。',
+            hint.configure(text='模型不能为空\n'
+                                '请在下拉里选一个，或选「自定义模型…」后填写名称。',
                            fg=theme.DANGER)
             custom_entry.focus_set()
             return
         provider, model = picked
+        key = key_entry.get().strip()
+        # 换了厂商却没填新密钥 → 写进去的是别家的 key，调用必然 401。
+        # 与其让用户拿到看不懂的报错，不如在这里拦住。
+        if not degrade and state.get('key_missing') and not key:
+            label = state['choices']['options'][state['choices'].get('index', 0)]['label'] \
+                if state['choices'].get('options') else '该厂商'
+            hint.configure(text=f'还没填 {label} 的 API Key\n'
+                                f'留空保存会沿用旧厂商的密钥，调用一定失败。',
+                           fg=theme.DANGER)
+            key_entry.focus_set()
+            return
         data = dict(cfg)                                 # 保留 api_key / label 等其它键
         if not degrade:
             data['provider'] = provider                  # 降级模式不动 provider
+            # label 只是给人看的注释，同步一下，免得配置里留着上一个厂商的名字
+            idx = state['choices'].get('index', -1)
+            options = state['choices'].get('options') or []
+            if 0 <= idx < len(options):
+                data['label'] = options[idx].get('label') or provider
         data['model'] = model
         data['base_url'] = base_entry.get().strip()
-        key = key_entry.get().strip()
         if key:
             data['api_key'] = key
         try:
@@ -243,7 +307,12 @@ def open_settings(app) -> None:
              font=theme.ui_font(8), anchor='w').grid(
         row=last_row + 2, column=0, columnspan=2, sticky='w', pady=(12, 0))
 
-    key_entry.focus_set()
+    # 焦点给「马上要操作的控件」，而不是密钥框：密钥多数情况不用改，
+    # 打开就停在密钥上会让人以为必须填。
+    if not degrade and provider_cb is not None:
+        provider_cb.focus_set()
+    else:
+        custom_entry.focus_set()
     win.update_idletasks()
     x = app.root.winfo_rootx() + (app.root.winfo_width() - win.winfo_width()) // 2
     y = app.root.winfo_rooty() + (app.root.winfo_height() - win.winfo_height()) // 3

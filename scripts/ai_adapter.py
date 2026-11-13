@@ -86,6 +86,12 @@ def _format_http_error(exc) -> str:
     return f'Error: HTTP {exc.code} {exc.reason}{detail}{hint}'
 
 
+# 最近一次请求的终止原因（finish_reason / reasoning_tokens）。
+# provider 层只返回字符串，拿不到这些字段；用模块级变量记一手，
+# 让调用方在"回复被截断"时能给出准确原因而不是笼统的解析失败。
+_LAST_FINISH: Dict[str, object] = {'reason': None, 'reasoning_tokens': 0}
+
+
 def _extract_content(result: Dict, model: str = '') -> str:
     """取回复正文。
 
@@ -97,6 +103,12 @@ def _extract_content(result: Dict, model: str = '') -> str:
         choice = (result.get('choices') or [{}])[0]
     except Exception:
         return ''
+    # 记下这次的真实终止原因：正文不空但被截断时，上层（如审查的 JSON 解析）
+    # 只能看到"JSON 不完整"，分不清是模型胡说还是额度不够，这里留下一手证据。
+    _LAST_FINISH['reason'] = choice.get('finish_reason')
+    usage_ = result.get('usage') or {}
+    _LAST_FINISH['reasoning_tokens'] = (
+        (usage_.get('completion_tokens_details') or {}).get('reasoning_tokens') or 0)
     msg = choice.get('message') or {}
     content = msg.get('content')
     if isinstance(content, list):  # 部分网关把正文分段返回
@@ -115,6 +127,24 @@ def _extract_content(result: Dict, model: str = '') -> str:
                 f'把 max_tokens 调大，或换非推理模型。）')
     if finish == 'length':
         return '（正文为空：回复被 max_tokens 截断，请调大 max_tokens。）'
+    return ''
+
+
+def non_json_reply(response: str) -> str:
+    """回复明显不是 JSON 时，返回一句能看懂的原因；是 JSON 则返回空串。
+
+    这些文本都是本模块自己拼的说明（正文为空、HTTP 错误），
+    形状和 JSON 差得远，直接丢给 json.loads 只会得到
+    "Expecting value: line 1 column 1 (char 0)"，用户完全看不出发生了什么。
+    """
+    text = (response or '').strip()
+    if not text:
+        return 'AI 返回了空内容（请求可能超时，或模型没有输出正文）。'
+    if text.startswith('Error:'):
+        # HTTP 4xx/5xx、网络错误：原因已经写在第一行
+        return f'AI 调用失败：{text.splitlines()[0]}'
+    if text.startswith('（') and ('正文为空' in text or '截断' in text):
+        return f'AI 没有返回可解析的内容：{text}'
     return ''
 
 
@@ -328,6 +358,22 @@ class AIClient:
             self.provider = provider_class(api_key, model, base_url=base_url)
         else:
             self.provider = provider_class(api_key, model)
+        # 最近一次回复的终止原因：'length' 表示被 max_tokens 截断
+        self.last_finish_reason: Optional[str] = None
+        self.last_reasoning_tokens: int = 0
+
+    def _sync_finish_state(self) -> None:
+        self.last_finish_reason = _LAST_FINISH.get('reason')  # type: ignore[assignment]
+        self.last_reasoning_tokens = int(_LAST_FINISH.get('reasoning_tokens') or 0)
+
+    def truncation_hint(self) -> str:
+        """回复被截断时给一句可操作的建议；没截断返回空串。"""
+        if self.last_finish_reason != 'length':
+            return ''
+        if self.last_reasoning_tokens:
+            return (f'（回复被 max_tokens 截断，其中 {self.last_reasoning_tokens} tokens '
+                    f'被推理过程用掉。请调大 max_tokens，或换非推理模型。）')
+        return '（回复被 max_tokens 截断，请调大 max_tokens。）'
 
     def chat(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> str:
         """
@@ -348,7 +394,9 @@ class AIClient:
 
         messages.append({"role": "user", "content": prompt})
 
-        return self.provider.chat(messages, **kwargs)
+        reply = self.provider.chat(messages, **kwargs)
+        self._sync_finish_state()
+        return reply
 
     def chat_with_history(self, messages: List[Dict], **kwargs) -> str:
         """
@@ -361,7 +409,9 @@ class AIClient:
         Returns:
             AI 响应文本
         """
-        return self.provider.chat(messages, **kwargs)
+        reply = self.provider.chat(messages, **kwargs)
+        self._sync_finish_state()
+        return reply
 
 
 # ============================================================================

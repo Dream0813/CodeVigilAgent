@@ -246,12 +246,22 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
 
     private let existingProvider: String
     private let existingModel: String
+    /// 打开对话框时的 base_url / 密钥：用来判断用户是否真的换了厂商，
+    /// 切回原厂商时把原密钥填回去。
+    private let existingBaseURL: String
+    private let savedKey: String
+    private var keyMissing = false
+    /// selection() 失败的原因，供调用方原样显示（比固定文案准确）
+    private(set) var validationError: String?
 
     init(existing: [String: Any], load: ModelCatalogLoad) {
         existingProvider = (existing["provider"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         existingModel = (existing["model"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        existingBaseURL = (existing["base_url"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        savedKey = existing["api_key"] as? String ?? ""
         super.init()
         buildViews(existing: existing, load: load)
     }
@@ -336,9 +346,9 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
     }
 
     /// 保存校验失败时把原因写进对话框，而不是让对话框直接关掉、用户白填一遍
-    func showHint(_ text: String) {
+    func showHint(_ text: String, color: NSColor = .systemRed) {
         hintLabel.stringValue = text
-        hintLabel.textColor = .systemRed
+        hintLabel.textColor = color
     }
 
     private func selectedEntry() -> ModelCatalogEntry? {
@@ -382,6 +392,22 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         // 切厂商时自动带出该厂商的 base_url；用户之后仍可手动改
         baseURLField.stringValue = entry?.baseURL ?? ""
         populateModels(for: entry, preferred: entry == nil ? existingModel : "")
+        // 各家密钥不通用：换了厂商还留着旧 key，调用必然 401。
+        // 直接清空并提示，避免用户看到一串圆点以为已经填好。
+        let newBase = (entry?.baseURL ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if newBase != existingBaseURL {
+            if !keyField.stringValue.isEmpty {
+                keyField.stringValue = ""
+            }
+            keyMissing = true
+            showHint("已切换到 \(entry?.label ?? "该厂商")\n旧密钥已清空，请填写它的 API Key。")
+        } else {
+            if keyField.stringValue.isEmpty, !savedKey.isEmpty {
+                keyField.stringValue = savedKey
+            }
+            keyMissing = false
+            showHint("模型清单来自终端 CLI（\(displayedEntries.count) 个厂商）。", color: .secondaryLabelColor)
+        }
     }
 
     @objc private func modelChanged(_ sender: NSPopUpButton) {
@@ -403,8 +429,10 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         }
     }
 
-    /// 读回用户的选择；模型为空时返回 nil（调用方提示错误并保留原配置）。
+    /// 读回用户的选择；模型为空 / 换了厂商却没填密钥时返回 nil。
+    /// 失败原因写进 validationError，调用方原样显示即可。
     func selection() -> (provider: String, model: String, baseURL: String)? {
+        validationError = nil
         let modelIndex = modelPopup.indexOfSelectedItem
         // 手填框有内容就以它为准（和 Windows 端 prefer_custom 规则一致）；
         // 否则命中清单取下拉项，落在「自定义模型…」取文本框
@@ -413,13 +441,27 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         if model.isEmpty, displayedModels.indices.contains(modelIndex) {
             model = displayedModels[modelIndex]
         }
-        guard !model.isEmpty else { return nil }
+        guard !model.isEmpty else {
+            validationError = "模型不能为空\n请在下拉里选一个，或选「自定义模型…」后填写名称。"
+            return nil
+        }
+        let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if keyMissing, key.isEmpty {
+            let name = selectedEntry()?.label ?? "该厂商"
+            validationError = "还没填 \(name) 的 API Key\n留空保存会沿用旧厂商的密钥，调用一定失败。"
+            return nil
+        }
         // 「保持原值」场景下 provider 沿用配置里的值；两者都空时用内置默认，避免写空字符串
         let provider = selectedEntry()?.fileProvider
             ?? (existingProvider.isEmpty ? "deepseek" : existingProvider)
         return (provider,
                 model,
                 baseURLField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// 保存时写进配置的注释字段（配置里的 label 只是给人看的）。
+    func selectedLabel() -> String? {
+        selectedEntry()?.label
     }
 }
 
@@ -858,8 +900,8 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             selection = form.selection()
             if selection == nil {
-                // 不关窗口重来：用户填的 Key / base_url 还在，改一下模型就能存
-                form.showHint("模型不能为空：请在「模型」下拉里选一个，或选「自定义模型…」后填写名称。")
+                // 不关窗口重来：用户填的 Key / base_url 还在，改一下就能存
+                form.showHint(form.validationError ?? "模型不能为空：请在「模型」下拉里选一个。")
             }
         }
         guard let chosen = selection else { return }
@@ -867,6 +909,10 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         config["provider"] = chosen.provider
         config["model"] = chosen.model
         config["base_url"] = chosen.baseURL
+        if let label = form.selectedLabel() {
+            // label 只是配置里的注释，同步一下，免得留着上一个厂商的名字
+            config["label"] = label
+        }
         if !form.keyField.stringValue.isEmpty {
             config["api_key"] = form.keyField.stringValue
         }

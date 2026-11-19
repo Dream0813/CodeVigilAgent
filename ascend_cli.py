@@ -902,7 +902,7 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
                 scenario = p
         begin_think('本地 Git 审查')
         try:
-            md, _report = run_local_review(
+            md, report = run_local_review(
                 str(config_file or config_path()),
                 path=agent.work_root,
                 client=agent.client,
@@ -912,6 +912,8 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
             )
         finally:
             end_think('审查完成')
+        # 留住完整报告：/fix from-review 用它做证据源（审查→补丁闭环）
+        agent.last_review_report = report if isinstance(report, dict) and report else None
         agent.last_reply = md
         agent.history.extend([
             {'role': 'user', 'content': f'/review {arg}'.strip()},
@@ -973,12 +975,15 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
 
     if cmd == '/fix':
         explicit = None
-        first = arg.split()[0] if arg.split() else ''
-        if first in ('operator', 'inference', 'opengauss', 'general'):
-            explicit = None if first == 'general' else first
+        from_review = False
+        for token in arg.split():
+            if token in ('operator', 'inference', 'opengauss', 'general'):
+                explicit = None if token == 'general' else token
+            elif token.replace('_', '-').lower() in ('from-review', '--from-review', 'review'):
+                from_review = True
         begin_think('生成补丁预览')
         try:
-            reply = agent.propose_fix(explicit_scenario=explicit)
+            reply = agent.propose_fix(explicit_scenario=explicit, from_review=from_review)
         finally:
             end_think('预览就绪')
         _print_agent_reply(reply)
@@ -1250,7 +1255,7 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         '/exit', '/quit', '/chat', '/work', '/mode', '/network', '/sources',
         '/clear', '/status', '/history', '/export', '/copy', '/retry', '/new',
         '/back', '/save', '/sessions', '/resume', '/review', '/ci', '/checklist',
-        '/compare', '/context', '/fix', '/apply', '/discard', '/git', '/commit',
+        '/compare', '/context', '/fix', '/apply', '/discard', '/undo', '/git', '/commit',
         '/push', '/pr', '/ship', '/model', '/skill', '/mcp', '/commands',
         '/cost', '/dir', '/reveal', '/open', '/help', '/paste',
     ]
@@ -1662,7 +1667,7 @@ def main() -> int:
     review_parser.add_argument("--report", metavar="PATH",
                                help="额外生成 Markdown 报告（可与 --output 同时使用）")
     review_parser.add_argument("--json", action="store_true", help="输出 JSON")
-    review_parser.add_argument("--max-diff", type=int, default=12000)
+    review_parser.add_argument("--max-diff", type=int, default=60000)
     review_parser.add_argument("--require-full", action="store_true",
                                help="diff 截断或包含未提供内容的二进制文件时直接失败")
     review_parser.add_argument("--scenario", choices=["operator", "inference", "opengauss"],

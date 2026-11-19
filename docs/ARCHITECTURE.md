@@ -54,7 +54,9 @@
 | `chat_v2.py` | 终端对话流程 | 加对话能力时会 |
 | `scripts/term_ui.py` | 终端颜色 / 字形 / 盒子绘制 | 一般不动 |
 | `scripts/term_frame.py` | **宽度计算的唯一出处**（定位渲染 + 补空格兜底） | 一般不动 |
-| `scripts/smart_reviewer.py` | 审查主流程 | 加审查规则时会 |
+| `scripts/smart_reviewer.py` | 审查主流程（AI 路径：自适应额度 + 截断有界重试） | 加审查规则时改 rule_engine |
+| `scripts/rule_engine.py` | 离线规则审查（全量命中 + 字符串字面量防误报） | 加审查规则时 |
+| `scripts/fix_flow.py` | 补丁流程 mixin（/fix → /apply → /undo；`from-review` 数据桥） | 改「审查→修复」链路时 |
 | `scripts/custom_commands.py` | 自定义斜杠命令（读 `.reviewagent/commands`） | 一般不动 |
 | `scripts/file_mentions.py` | `@文件` 引用解析与安全边界 | 一般不动 |
 | `scripts/git_hooks.py` | pre-commit 钩子安装/卸载 | 一般不动 |

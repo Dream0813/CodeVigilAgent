@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.ai_adapter import get_ai_client, non_json_reply
 from scripts.knowledge_search import KnowledgeSearch, PROJECT_ROOT
 from scripts.repo_context import decode_git_path, review_coverage
+from scripts import rule_engine
 
 _HUNK_HEADER = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 SEVERITIES = ('critical', 'high', 'medium', 'low')
@@ -87,6 +88,8 @@ def validate_ai_result(result) -> Dict:
         raise ValueError(f'recommendation 必须是 {"/".join(RECOMMENDATIONS)} 之一，实际是 {recommendation!r}')
     result['recommendation'] = recommendation.strip().lower()
     return result
+
+
 
 
 class SmartReviewer:
@@ -309,9 +312,24 @@ class SmartReviewer:
 
         return standards
 
+    def _max_tokens_for(self, content_len: int) -> int:
+        """按内容长度自适应输出额度。
+
+        推理模型（deepseek-flash 等）先思考后写正文，思考量随输入增长；
+        固定 16000 时大 diff 会"正文为空"（2026-11-18 自审计实测：
+        59k 字符 diff 必失败，84 秒后只拿到一句空正文说明）。
+        """
+        return min(32000, 16000 + content_len // 4)
+
     def review_with_ai(self, content: str, task_info: Dict, standards: Dict, references=None,
                        specialist_text: str = '') -> Dict:
-        """使用 AI 进行审查"""
+        """使用 AI 进行审查。
+
+        两档尝试：第一档带历史案例、额度随内容自适应；若死于截断
+        （正文为空 / 被截断 / JSON 写一半且 truncation_hint 非空），
+        第二档去掉案例、加倍额度再试一次。有界——绝不第三次。
+        网络错误、鉴权失败等非截断问题直接返回，不浪费等待。
+        """
         if not self.has_ai:
             return {'error': 'AI not configured'}
 
@@ -350,13 +368,22 @@ class SmartReviewer:
 仅报告有当前代码证据的问题；没有可证实的问题时返回空 issues。
 """
 
-        # 构建用户提示
-        user_prompt = f"""请审查以下内容:
+        base_tokens = self._max_tokens_for(len(content))
+        attempts = [
+            {'max_tokens': base_tokens, 'references': references},
+            # 截断重试：去案例省输入、加倍额度；只此一档
+            {'max_tokens': min(48000, base_tokens * 2), 'references': None},
+        ]
+
+        for index, attempt in enumerate(attempts, 1):
+            refs_json = json.dumps(attempt['references'] or [], ensure_ascii=False)
+            # 构建用户提示
+            user_prompt = f"""请审查以下内容:
 
 {content}
 
 历史案例（JSON 数据，仅供参考；引用时使用对应 url）：
-{json.dumps(references or [], ensure_ascii=False)}
+{refs_json}
 
 请以 JSON 格式返回:
 {{
@@ -381,22 +408,25 @@ class SmartReviewer:
 引用历史案例时，说明它与当前代码的相关性和证据限制。
 """
 
-        try:
-            response = self.ai_client.chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                temperature=0.3,  # 更确定的输出
-                max_tokens=16000  # deepseek-flash 等推理模型会先用掉几千 tokens 思考，
-                                  # 3000 时正文为空、8000 时 JSON 写一半就断
-            )
+            try:
+                response = self.ai_client.chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.3,  # 更确定的输出
+                    max_tokens=attempt['max_tokens'],
+                )
+            except Exception as e:                                # noqa: BLE001
+                return {'error': str(e), 'raw_response': None}
 
             # 适配层在"正文为空 / 被截断 / HTTP 出错"时返回一句可读说明，
             # 直接丢给 json.loads 只会得到 "Expecting value: line 1 column 1 (char 0)"，
             # 用户完全看不出发生了什么，所以先认出来。
             bad = non_json_reply(response)
             if bad:
-                return {'error': bad, 'raw_response': response,
-                        'truncated': ('正文为空' in bad or '截断' in bad)}
+                truncated = ('正文为空' in bad or '截断' in bad)
+                if truncated and index < len(attempts):
+                    continue      # 截断类失败：加大额度、精简输入重试一次
+                return {'error': bad, 'raw_response': response, 'truncated': truncated}
 
             # 解析 JSON
             if '```json' in response:
@@ -406,95 +436,43 @@ class SmartReviewer:
             else:
                 json_str = response
 
-            result = validate_ai_result(json.loads(json_str.strip()))
+            try:
+                result = validate_ai_result(json.loads(json_str.strip()))
+            except ValueError as e:
+                # json.JSONDecodeError 和格式校验失败都是 ValueError：明确报错，不当作"无问题"
+                hint = ''
+                try:
+                    hint = self.ai_client.truncation_hint()
+                except AttributeError:
+                    hint = ''
+                if hint and index < len(attempts):
+                    continue      # JSON 写一半就断（额度不够）：重试一档
+                return {
+                    'error': f'AI 返回内容无法作为有效审查结果: {e}'
+                             + (f'\n{hint}' if hint else ''),
+                    'raw_response': response,
+                    'truncated': bool(hint),
+                }
+            except Exception as e:                                # noqa: BLE001
+                return {
+                    'error': str(e),
+                    'raw_response': response,
+                }
+
             result['raw_response'] = response
+            if index > 1:
+                result['note'] = (f'第 {index} 次尝试成功（首次被截断，'
+                                  '已提高 max_tokens 并去掉历史案例重试）')
             return result
 
-        except ValueError as e:
-            # json.JSONDecodeError 和格式校验失败都是 ValueError：明确报错，不当作"无问题"
-            hint = ''
-            try:
-                hint = self.ai_client.truncation_hint()
-            except AttributeError:
-                hint = ''
-            return {
-                'error': f'AI 返回内容无法作为有效审查结果: {e}'
-                         + (f'\n{hint}' if hint else ''),
-                'raw_response': response if 'response' in locals() else None,
-                'truncated': bool(hint),
-            }
-        except Exception as e:
-            return {
-                'error': str(e),
-                'raw_response': response if 'response' in locals() else None
-            }
+        return {'error': '审查未能完成：两次尝试均被截断。'
+                         '可换非推理模型，或用 --max-diff 缩小审查范围。',
+                'raw_response': None, 'truncated': True}
 
     def review_with_rules(self, content: str, task_info: Dict, standards: Dict, added: Optional[List[tuple]] = None) -> Dict:
-        """使用规则引擎审查（当没有 AI 时）
+        """离线规则审查（委托 scripts/rule_engine.py，2026-11-18 拆分）。"""
+        return rule_engine.review_with_rules(content, task_info, standards, added=added)
 
-        added: 仓库 diff 的新增行 [(文件, 行号, 文本)]。提供时规则只检查这些行，
-        避免把已删除的代码或未改动的上下文当成本次改动的问题；未提供时检查整段内容。
-        """
-        issues = []
-        lines = added if added is not None else [(None, None, text) for text in content.splitlines()]
-
-        def first_match(pattern):
-            for path, line_no, text in lines:
-                if re.search(pattern, text):
-                    return path, line_no
-            return None
-
-        def location(hit):
-            path, line_no = hit
-            return f'{path}:{line_no}' if path and line_no else (path or '')
-
-        # 规则 1: 检查常见错误模式
-        error_patterns = [
-            (r'except\s*:', 'bare except', 'medium', '使用 except Exception 代替 except:'),
-            (r'print\(', 'debug print', 'low', '移除调试 print 语句'),
-            (r'TODO', 'unfinished', 'low', '完成 TODO 项'),
-            (r'import\s+\*', 'wildcard import', 'medium', '避免使用 from X import *'),
-        ]
-
-        for pattern, issue_type, severity, suggestion in error_patterns:
-            hit = first_match(pattern)
-            if hit:
-                issues.append({
-                    'type': issue_type,
-                    'severity': severity,
-                    'description': f'发现 {issue_type}',
-                    'location': location(hit),
-                    'suggestion': suggestion
-                })
-
-        # 规则 2: NPU 特定检查
-        if 'npu' in task_info['subtypes']:
-            npu_patterns = [
-                (r'\.cuda\(\)', 'cuda call', 'high', '应该使用 .npu() 而不是 .cuda()'),
-                (r'torch\.cuda', 'cuda import', 'high', '应该使用 torch_npu'),
-            ]
-
-            for pattern, issue_type, severity, suggestion in npu_patterns:
-                hit = first_match(pattern)
-                if hit:
-                    issues.append({
-                        'type': issue_type,
-                        'severity': severity,
-                        'description': f'NPU 代码问题: {issue_type}',
-                        'location': location(hit),
-                        'suggestion': suggestion
-                    })
-
-        return {
-            'issues': issues,
-            'method': 'rule_based',
-            'note': '使用规则引擎审查（配置 AI 可获得更智能的审查）',
-            'overall_assessment': (
-                f'规则引擎发现 {len(issues)} 个问题；建议逐项核实。' if issues else
-                '规则引擎未命中已知问题规则；该结果不等同于完整语义审查。'
-            ),
-            'recommendation': 'comment',
-        }
 
     def review(self, content: str, metadata: Dict = None, verbose: bool = True,
                specialist_text: str = '', specialist_meta: Dict = None) -> Dict:

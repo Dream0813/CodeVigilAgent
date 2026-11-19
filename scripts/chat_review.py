@@ -15,7 +15,7 @@ def run_local_review(
     *,
     staged: bool = False,
     offline: bool = True,
-    max_diff: int = 12000,
+    max_diff: int = 60000,
     scenario: Optional[str] = None,
     path: Optional[Path] = None,
     client=None,
@@ -122,7 +122,7 @@ def _format_report(report: dict, *, staged: bool, warn: str) -> str:
     if len(issues) > 20:
         lines.append(f"\n… 另有 {len(issues) - 20} 条未展开。")
     lines.append('')
-    lines.append('可用 `/export` 保存；要改代码可继续对话或 `/fix`（需先有 PR/粘贴上下文）。')
+    lines.append('可用 `/export` 保存；要改代码可 `/fix from-review`（基于本报告生成补丁预览），或粘贴 PR/Issue 后 `/fix`。')
     return '\n'.join(lines)
 
 

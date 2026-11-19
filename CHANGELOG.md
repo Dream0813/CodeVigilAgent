@@ -2,6 +2,20 @@
 
 ---
 
+## 未发布：自我审计修复批次 (2026-11-19)
+
+源自 2026-11-18 自我审计（用自家审查智能体审本仓库，11 条 AI 结论逐条复核）：
+
+- **审查容量**：`--max-diff` 默认 12000→60000（旧默认下 pre-commit 钩子 `--require-full` 组合会拦截 >12k 字符的提交，实测 exit 1）；在线审查 `max_tokens` 随内容长度自适应（16000–32000），截断类失败去案例、加倍额度有界重试一次（59k diff 旧版必失败：推理模型吃满 16000 tokens 空正文）
+- **AI 读超时** 60s→180s：非流式接口上推理模型审大 diff 经常 60 秒不出首字节，等于必败（实测 `read operation timed out`）
+- **规则引擎**：每条规则报全部命中（旧版只报首个，其余漏报，上限 10 处/规则）；命中落在字符串字面量里的跳过（子进程命令串里的 `print` 不再误报，自审计样本 1/1 误报清零）；独立成 `scripts/rule_engine.py`
+- **审查→修复闭环（P0）**：`/fix from-review` 基于最近一次 `/review` 报告的 issues+diff 生成补丁预览（旧版 /fix 只认网页 PR/Issue 上下文，本地审查结论喂不进去）
+- **/undo 一键回滚**：`/apply` 成功后在会话内存保留前后快照，`/undo` 整批验证（文件须未被再次修改）后原子还原；create 的文件删除；命令注册走 `scripts/cli_commands/fix_undo.py`（结构守卫：不往 `handle_chat_slash` 堆 if）
+- **结构拆分**：`scripts/fix_flow.py`（FixFlowMixin，/fix //apply //undo 流程）从 conversation_agent.py 拆出；两文件均回到结构守卫预算内
+- 新增 21 项回归（`tests/test_review_engine_upgrade_20261118.py`）：自适应额度、截断重试、误报过滤、from-review 桥、undo 往返/冲突拒绝
+
+---
+
 ## 未发布：桌面版历史会话面板 (2026-11-13)
 
 - Windows 桌面版右侧新增「历史会话」面板：搜索标题/内容、三行卡片（标题 / 时间·轮次 / 预览）、点开即恢复完整对话并自动滚到最新

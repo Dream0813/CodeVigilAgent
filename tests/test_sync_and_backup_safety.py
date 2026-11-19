@@ -278,12 +278,14 @@ class CommitHookCoverageTests(unittest.TestCase):
             repo = root / 'repo'
             repo.mkdir()
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
-            (repo / 'npu.py').write_text('# npu\n' + '# padding line\n' * 1200 + 'x.cuda()\n')
+            # 2026-11-19：--max-diff 默认已提到 60000（旧 12000 会拦下中等提交），
+            # 截断场景的 fixture 相应放大到 ~90k 字符。
+            (repo / 'npu.py').write_text('# npu\n' + '# padding line\n' * 6200 + 'x.cuda()\n')
             subprocess.run(['git', '-C', str(repo), 'add', 'npu.py'], check=True)
             hook, _ = git_hooks.install(str(repo), sys.executable, str(cli))
             env = dict(os.environ, REVIEWAGENT_HOME=str(root / 'home'))
             proc = subprocess.run(['sh', str(hook)], cwd=repo, env=env,
-                                  capture_output=True, text=True, timeout=30)
+                                  capture_output=True, text=True, timeout=60)
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn('--max-diff', proc.stderr)
 

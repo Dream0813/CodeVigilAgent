@@ -10,16 +10,8 @@ import urllib.error
 
 from scripts.knowledge_search import KnowledgeSearch
 from scripts.web_search import WebSearcher
-from scripts.patch_fix import (
-    FIX_SYSTEM,
-    ProposedFix,
-    apply_fix,
-    detect_domain_from_contexts,
-    format_apply_result,
-    parse_fix_json,
-    preview_fix,
-    work_root,
-)
+from scripts.fix_flow import FixFlowMixin
+from scripts.patch_fix import work_root
 
 
 SYSTEM_PROMPT = """你是 ReviewAgent：通用编程助手，并在「昇腾 / CANN / AI Infra」问题上有专项能力。
@@ -405,7 +397,7 @@ class UserMessage(str):
         return message
 
 
-class ConversationAgent:
+class ConversationAgent(FixFlowMixin):
     def __init__(self, client, knowledge=None, fetcher=None, progress=None,
                  network='auto', searcher=None):
         self.client = client
@@ -424,6 +416,12 @@ class ConversationAgent:
         # 最近一次 answer() 是否产出了模型回答；一次性 CLI 据此决定退出码，不用解析回复文字
         self.last_ok = True
         self.pending_fix = None  # type: Optional[ProposedFix]
+        # 最近一次 /review 的完整报告（dict）。/fix from-review 用它当证据源，
+        # 打通「本地审查发现问题 → 生成补丁预览」的闭环（2026-11-18 P0）。
+        self.last_review_report = None  # type: Optional[dict]
+        # 最近一次成功 /apply 的回滚快照（内存，不落盘；会话结束即失效）。
+        # /undo 用它一键还原。
+        self.undo_bundle = None  # type: Optional[list]
         self.work_root = work_root()
         # auto(AI自动调换) | chat | work — /chat /work 可钉住；/mode auto 恢复自动调换
         self.chat_mode = 'auto'
@@ -593,78 +591,6 @@ class ConversationAgent:
     def close(self) -> None:
         if self._mcp is not None:
             self._mcp.close()
-
-    def discard_fix(self) -> str:
-        if not self.pending_fix:
-            return '当前没有待确认的补丁。'
-        self.pending_fix = None
-        return '已丢弃待确认补丁。'
-
-    def propose_fix(self, explicit_scenario: Optional[str] = None) -> str:
-        """Generate a patch preview from active PR/Issue context. Does not write files."""
-        self.last_ok = True
-        self.pending_fix = None
-        if not self.contexts:
-            return self._fail('没有活跃的 PR/Issue 上下文。请先粘贴 GitHub 链接完成分析，再输入 /fix。')
-        try:
-            scenario, reason, specialist_text = detect_domain_from_contexts(
-                self.contexts, explicit=explicit_scenario)
-        except (ValueError, OSError) as exc:
-            return self._fail(f'专业上下文未就绪：{exc}')
-        self.progress(f'识别领域: {scenario}（{reason or "n/a"}）')
-        if scenario in ('operator', 'inference', 'opengauss') and not specialist_text:
-            self.progress('专业规范未加载到正文，将用通用规则生成补丁预览')
-
-        payload = {
-            'instruction': '请基于证据生成可本地应用的最小补丁 JSON。',
-            'scenario': scenario,
-            'specialist_reason': reason,
-            'specialist_rules': specialist_text or '',
-            'active_pr_issues': self.contexts,
-            'recent_dialogue': self.history[-4:],
-            'work_root': str(self.work_root),
-        }
-        self.progress('生成补丁预览（不会写入磁盘）…')
-        try:
-            raw = self.client.chat(
-                json.dumps(payload, ensure_ascii=False),
-                system_prompt=FIX_SYSTEM,
-                temperature=0.2,
-                max_tokens=4000,
-            )
-        except Exception:
-            return self._fail('生成补丁时 AI 请求异常。')
-        if not isinstance(raw, str) or not raw.strip() or raw.lstrip().startswith('Error:'):
-            return self._fail('生成补丁失败：' + (raw if isinstance(raw, str) else '未知错误'))
-
-        try:
-            fix = parse_fix_json(raw)
-        except ValueError as exc:
-            return self._fail(f'补丁格式错误：{exc}。请重新 /fix。')
-        fix.specialist_reason = reason
-        if not fix.scenario or fix.scenario == 'general':
-            fix.scenario = scenario
-        self.pending_fix = fix
-        return preview_fix(fix, root=self.work_root)
-
-    def apply_pending_fix(self, confirm: bool = False, dry_run: bool = False) -> str:
-        """Apply pending fix only when confirm=True (or dry_run preview of apply)."""
-        self.last_ok = True
-        if not self.pending_fix:
-            return self._fail('没有待应用的补丁。请先 /fix 生成预览。')
-        if not confirm and not dry_run:
-            return self._fail('安全起见：请使用 /apply 明确确认后再写入。可用 /fix 重新预览。')
-        if not self.pending_fix.files:
-            self.pending_fix = None
-            return '补丁为空，未写入任何文件。'
-        self.progress('写入本地改动…' if not dry_run else 'dry-run 检查…')
-        result = apply_fix(self.pending_fix, root=self.work_root, dry_run=dry_run)
-        self.last_ok = bool(result.get('ok'))
-        text = format_apply_result(result)
-        if not dry_run and self.last_ok:
-            self.pending_fix = None
-            text += '\n\n待确认补丁已清除。可用 git diff 检查改动。'
-        return text
 
     def investigate(self, text, evidence):
         """Bounded model-selected read-only investigation using a portable JSON protocol."""

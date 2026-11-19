@@ -121,6 +121,23 @@ def detect_domain_from_contexts(contexts: List[Dict], explicit: Optional[str] = 
     return 'general', load.reason or 'general', ''
 
 
+def detect_domain_from_diff(diff: str, paths, explicit: Optional[str] = None) -> Tuple[str, str, str]:
+    """Return (scenario|general, reason, specialist_text) for a local review diff.
+
+    与 detect_domain_from_contexts 同一套判定，只是证据来源是本地 /review
+    的仓库 diff，而不是网页 PR/Issue 上下文。
+    """
+    load = detect_scenario(diff, paths=list(paths or []), explicit=explicit)
+    if load.status == 'ready' and load.scenario:
+        full = load_specialist_context(load.scenario)
+        if full.status != 'ready':
+            raise ValueError(full.reason)
+        return load.scenario, load.reason or full.reason, full.text or ''
+    if load.status == 'needs_context':
+        return 'general', load.reason or load.question or '领域未判定，使用通用规范', ''
+    return 'general', load.reason or 'general', ''
+
+
 def parse_fix_json(raw: str) -> ProposedFix:
     if not isinstance(raw, str):
         raise ValueError('模型补丁必须是 JSON 文本')
@@ -375,3 +392,173 @@ def format_apply_result(result: Dict) -> str:
         if row.get('recovery_file'):
             lines.append(f"    原文件备份: {row['recovery_file']}")
     return '\n'.join(lines)
+
+
+# ------------------------------------------------------------------ undo
+def capture_undo_bundle(fix: ProposedFix, root: Optional[Path] = None) -> Optional[List[Dict]]:
+    """补丁写入前抓取回滚快照：[{path, action, before(bytes|None), mode}]。
+
+    任何一个文件读不了（或 create 目标已存在、路径不安全、是链接）就整体
+    返回 None —— 宁可不提供 undo，不提供会写错内容的 undo。快照只留在
+    调用方（会话内存）里，不落盘，避免污染用户家目录。
+    """
+    root = Path(root) if root is not None else work_root()
+    bundle: List[Dict] = []
+    for edit in fix.files:
+        rel = _safe_relpath(edit.path)
+        if rel is None:
+            return None
+        target = root / rel
+        if edit.action == 'create':
+            if target.exists():
+                return None   # apply 也会拒绝覆盖，无需 undo
+            bundle.append({'path': edit.path, 'action': 'create',
+                           'before': None, 'mode': None})
+        else:
+            if not target.is_file() or os.path.islink(target):
+                return None
+            try:
+                before = target.read_bytes()
+                mode = stat.S_IMODE(target.stat().st_mode)
+            except OSError:
+                return None
+            bundle.append({'path': edit.path, 'action': 'replace',
+                           'before': before, 'mode': mode})
+    return bundle or None
+
+
+def finalize_undo_bundle(bundle: Optional[List[Dict]], fix: ProposedFix,
+                          root: Optional[Path] = None) -> Optional[List[Dict]]:
+    """补丁成功写入后补上 after 内容；读不了就整体放弃 undo。"""
+    if not bundle:
+        return None
+    root = Path(root) if root is not None else work_root()
+    if len(bundle) != len(fix.files):
+        return None
+    for entry, edit in zip(bundle, fix.files):
+        if entry.get('path') != edit.path:
+            return None
+        rel = _safe_relpath(edit.path)
+        target = root / rel if rel is not None else None
+        if target is None or not target.is_file():
+            return None
+        try:
+            entry['after'] = target.read_bytes()
+        except OSError:
+            return None
+    return bundle
+
+
+def apply_undo_bundle(bundle: Optional[List[Dict]], root: Optional[Path] = None) -> Dict:
+    """回滚 capture/finalize 抓的快照。结果结构与 apply_fix 对齐。
+
+    安全约束与 apply_fix 同源：整批先验证——当前文件内容必须仍等于
+    apply 后的内容（after），否则说明已被再次修改，拒绝回滚；验证通过
+    后经目录锚定句柄原子替换回 before（create 的文件删除）。undo 使用的
+    是 apply 已经放行过的路径，但仍走一遍 _safe_relpath 复核。
+    """
+    root = Path(root) if root is not None else work_root()
+    entries = [e for e in (bundle or []) if isinstance(e, dict)]
+    result = {'root': str(root), 'ok': False, 'applied': 0,
+              'total': len(entries), 'dry_run': False, 'results': []}
+    if not entries:
+        result['error'] = '没有可回滚的 /apply 快照。'
+        return result
+    try:
+        paths = PatchPaths(root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        result['error'] = f'回滚验证失败，未写入任何文件: {exc}'
+        return result
+    try:
+        return _undo_anchored(entries, paths, result)
+    finally:
+        paths.close(remove_created=False)
+
+
+def _undo_anchored(entries: List[Dict], paths, result: Dict) -> Dict:
+    root = paths.root
+    result['root'] = str(root)
+    plans, seen = [], set()
+    try:
+        for entry in entries:
+            row = {'path': str(entry.get('path') or ''), 'status': 'not_applied'}
+            result['results'].append(row)
+            try:
+                rel = _safe_relpath(str(entry.get('path') or ''))
+                if not rel or entry.get('action') not in ('replace', 'create'):
+                    raise ValueError('非法路径或操作（禁止 Git 元数据）')
+                anchored = paths.target(rel)
+                if anchored.path in seen:
+                    raise ValueError('同一文件不能包含多条回滚')
+                seen.add(anchored.path)
+                after = entry.get('after')
+                before = entry.get('before')
+                if not isinstance(after, bytes):
+                    raise ValueError('快照缺少 after 内容，无法校验一致性')
+                if entry.get('action') == 'create':
+                    if not anchored.exists():
+                        row.update(status='already_restored')
+                        continue
+                    if anchored.read_bytes() != after:
+                        raise ValueError('文件与补丁应用后不一致，拒绝回滚（可能已被再次修改）')
+                    plans.append({'target': anchored, 'action': 'delete',
+                                  'after': after, 'row': row})
+                else:
+                    if not isinstance(before, bytes):
+                        raise ValueError('快照缺少 before 内容')
+                    current, current_mode = anchored.snapshot()
+                    if current != after:
+                        raise ValueError('文件与补丁应用后不一致，拒绝回滚（可能已被再次修改）')
+                    mode = entry.get('mode')
+                    plans.append({'target': anchored, 'action': 'restore',
+                                  'before': before, 'after': after, 'row': row,
+                                  'mode': mode if mode is not None else current_mode})
+            except (OSError, ValueError, RuntimeError) as exc:
+                row.update(status='rejected', error=str(exc))
+        if any(row['status'] == 'rejected' for row in result['results']):
+            result['error'] = '回滚验证失败，未写入任何文件'
+            return result
+    except (OSError, ValueError, RuntimeError) as exc:
+        result['error'] = f'回滚验证失败，未写入任何文件: {exc}'
+        return result
+
+    written, staged_files = [], []
+    try:
+        for plan in plans:
+            if plan['action'] == 'restore':
+                plan['staged'] = plan['target'].stage(plan['before'], plan['mode'])
+                staged_files.append(plan['staged'])
+        for plan in plans:
+            target = plan['target']
+            if target.read_bytes() != plan['after']:
+                raise ValueError(f'验证后文件已变化，拒绝回滚: {plan["row"]["path"]}')
+            if plan['action'] == 'delete':
+                target.unlink()
+                plan['row']['status'] = 'deleted'
+            else:
+                plan['target'].replace_from(plan['staged'])
+                plan['row']['status'] = 'replaced'
+            written.append(plan)
+        result.update(ok=True, applied=len(written))
+    except (OSError, ValueError, KeyboardInterrupt) as exc:
+        # 回滚中途失败：把已回滚的部分恢复到 /apply 后的内容，不留半途现场
+        result['error'] = f'回滚中断，已尝试恢复到 /apply 后的内容: {exc}'
+        for plan in reversed(written):
+            try:
+                target = plan['target']
+                restored = target.stage(plan['after'], plan.get('mode'))
+                try:
+                    target.replace_from(restored)
+                finally:
+                    restored.unlink()
+                plan['row']['status'] = 'reverted_undo'
+            except (OSError, ValueError) as rollback_exc:
+                plan['row'].update(status='undo_conflict', error=str(rollback_exc))
+        result['applied'] = 0
+    finally:
+        for staged in staged_files:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+    return result

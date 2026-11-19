@@ -148,7 +148,9 @@ def non_json_reply(response: str) -> str:
     return ''
 
 
-def _post_json(url: str, headers: Dict, data: Dict, timeout: int = 60) -> Dict:
+def _post_json(url: str, headers: Dict, data: Dict, timeout: int = 180) -> Dict:
+    # 180s：推理模型审大 diff 时（59k 字符、思考 + 长正文）经常超过 60 秒
+    # 才吐第一个字节——非流式接口上 60s 读超时等于必败（2026-11-18 实测）。
     import urllib.error
     req = urllib.request.Request(
         url,

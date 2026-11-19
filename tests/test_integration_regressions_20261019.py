@@ -32,7 +32,7 @@ class IntegrationTests(unittest.TestCase):
                 patch('ascend_cli.begin_think'), patch('ascend_cli.end_think'), \
                 patch('ascend_cli._print_agent_reply'):
             ascend_cli.handle_chat_slash('/fix opengauss', current)
-        fix.assert_called_once_with(explicit_scenario='opengauss')
+        fix.assert_called_once_with(explicit_scenario='opengauss', from_review=False)
 
     def test_ship_stops_after_failed_commit_despite_success_word_in_hook(self):
         current = agent()
